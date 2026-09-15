@@ -26,6 +26,9 @@ TODO.md
 PLAN.md
 DEVNOTES.md
 
+# Local RAG database
+/app/data/haiku.rag.lancedb/
+
 # mcp registry
 .mcpregistry_github_token
 .mcpregistry_registry_token
