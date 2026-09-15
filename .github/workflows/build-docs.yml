@@ -8,10 +8,8 @@ on:
       - main
 permissions:
   contents: read
-  pages: write
-  id-token: write
 concurrency:
-  group: pages-${{ github.ref }}
+  group: docs-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   build:
@@ -21,19 +19,3 @@ jobs:
       - uses: astral-sh/setup-uv@v9.0.0
       - run: uv sync --group dev
       - run: uv run zensical build
-      - uses: actions/configure-pages@v5
-        if: github.event_name == 'push'
-      - uses: actions/upload-pages-artifact@v3
-        if: github.event_name == 'push'
-        with:
-          path: ./site
-  deploy:
-    needs: build
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
