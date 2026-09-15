@@ -1,0 +1,43 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+**/.DS_Store
+
+# Virtual environments
+.venv
+
+# tests
+.coverage*
+evaluations/evaluations/data/
+evaluations/scripts/*
+!evaluations/scripts/build_t2_submission.py
+tests/data/
+.pytest_cache/
+.ruff_cache/
+
+# environment variables and config files
+.env
+haiku.rag.yaml
+TODO.md
+PLAN.md
+DEVNOTES.md
+
+# mcp registry
+.mcpregistry_github_token
+.mcpregistry_registry_token
+
+# zensical site directory when doing local docs builds
+site/
+
+# Claude Code personal notes
+.claude.local.md
+
+# Publish shared Claude skills, keep local Claude settings private
+!.claude/
+.claude/*
+!.claude/skills/
+!.claude/skills/**

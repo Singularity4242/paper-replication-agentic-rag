@@ -1,0 +1,1130 @@
+import asyncio
+import json
+from collections.abc import Callable, Mapping
+from enum import StrEnum
+from pathlib import Path
+
+import httpx
+import numpy as np
+import yaml
+from pydantic import BaseModel, Field
+
+from haiku.rag.config import AppConfig
+from haiku.rag.config.models import (
+    DuplicateDetectionConfig,
+    EmbeddingModelConfig,
+    ModelConfig,
+)
+from haiku.rag.store.engine import Store, connect_lancedb
+from haiku.rag.store.info import get_database_stats
+from haiku.rag.store.schema import REQUIRED_TABLES, index_specs
+from haiku.rag.store.upgrades import get_pending_upgrades
+
+# Cap how many offending ids we collect per check; doctor is a summary, not a dump.
+_SAMPLE_LIMIT = 5
+
+# API providers and the environment variable that carries their key.
+_PROVIDER_ENV_VARS: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "cohere": "CO_API_KEY",
+    "voyageai": "VOYAGE_API_KEY",
+    "jina": "JINA_API_KEY",
+    "zeroentropy": "ZEROENTROPY_API_KEY",
+}
+
+# Providers backed by in-process local models — no endpoint to probe.
+_LOCAL_PROVIDERS = {"sentence-transformers", "cross-encoder", "jina-local"}
+
+# Item labels that never yield a standalone chunk: pictures (handled via the
+# image path), headings (folded into chunk context, not embedded alone), and
+# page furniture. A document whose only items carry these labels is expected to
+# have no chunks.
+_NON_BODY_LABELS = {
+    "picture",
+    "section_header",
+    "title",
+    "page_header",
+    "page_footer",
+    "caption",
+}
+
+# Operators care whether an endpoint answers now, not eventually.
+_PROBE_TIMEOUT_S = 2.0
+
+
+class Severity(StrEnum):
+    OK = "ok"
+    WARN = "warn"
+    FAIL = "fail"
+
+
+class CheckResult(BaseModel):
+    name: str
+    severity: Severity
+    message: str
+    remediation: str | None = None
+    details: list[str] = Field(default_factory=list)
+
+
+class DoctorReport(BaseModel):
+    results: list[CheckResult] = Field(default_factory=list)
+
+    @property
+    def failed(self) -> bool:
+        return any(r.severity is Severity.FAIL for r in self.results)
+
+    def count(self, severity: Severity) -> int:
+        return sum(1 for r in self.results if r.severity is severity)
+
+
+def _sample(ids: list[str]) -> list[str]:
+    """Cap a list of offending ids for display, noting how many were elided."""
+    if len(ids) <= _SAMPLE_LIMIT:
+        return list(ids)
+    extra = len(ids) - _SAMPLE_LIMIT
+    return [*ids[:_SAMPLE_LIMIT], f"... (+{extra} more)"]
+
+
+def _active_models(config: AppConfig) -> list[ModelConfig | EmbeddingModelConfig]:
+    """Every model role the config activates.
+
+    Picture-description and title models are only included when their feature
+    is enabled (``processing.pictures == "description"`` / ``auto_title``), so
+    doctor checks exactly the providers the next ingest will use.
+    """
+    models: list[ModelConfig | EmbeddingModelConfig] = [config.embeddings.model]
+    for model in (config.reranking.model, config.qa.model, config.analysis.model):
+        if model is not None:
+            models.append(model)
+
+    proc = config.processing
+    if proc.pictures == "description":
+        models.append(proc.conversion_options.picture_description.model)
+    if proc.auto_title:
+        models.append(proc.title_model)
+    return models
+
+
+def _check_api_keys(config: AppConfig, environ: dict[str, str]) -> CheckResult:
+    # A custom base_url points at a self-hosted OpenAI-compatible endpoint that
+    # uses a placeholder key, so the SaaS key is only required when a provider
+    # is used without one, and without a key in the config. Reachability of
+    # custom endpoints is the probe's job.
+    need_key = {
+        model.provider
+        for model in _active_models(config)
+        if not model.base_url
+        and not model.api_key
+        and model.provider in _PROVIDER_ENV_VARS
+    }
+    missing = [
+        f"{provider} ({_PROVIDER_ENV_VARS[provider]})"
+        for provider in sorted(need_key)
+        if not environ.get(_PROVIDER_ENV_VARS[provider])
+    ]
+    if missing:
+        return CheckResult(
+            name="api_keys",
+            severity=Severity.FAIL,
+            message="Configured providers are missing their API key.",
+            remediation="Set the listed environment variables.",
+            details=missing,
+        )
+    return CheckResult(
+        name="api_keys",
+        severity=Severity.OK,
+        message="API keys present for all configured providers.",
+    )
+
+
+def _check_tables_present(stats: dict) -> CheckResult:
+    missing = [name for name in REQUIRED_TABLES if not stats[name]["exists"]]
+    if missing:
+        return CheckResult(
+            name="tables_present",
+            severity=Severity.FAIL,
+            message="Required tables are missing.",
+            remediation="Run 'haiku-rag init' for a new database or 'haiku-rag migrate'.",
+            details=missing,
+        )
+    return CheckResult(
+        name="tables_present",
+        severity=Severity.OK,
+        message="All required tables are present.",
+    )
+
+
+def _classify_unchunked(
+    no_chunk_ids: set[str],
+    labels_by_doc: dict[str, set[str]],
+    supports_images: bool,
+) -> list[CheckResult]:
+    """Classify chunk-less documents by what they hold.
+
+    A document with body-text items but no chunks is always a problem. A
+    picture-only document is a problem under a multimodal embedder (its picture
+    chunks are missing) and an indexing gap under a text-only embedder (which
+    cannot embed images). A document carrying only headings/furniture (or no
+    items at all) is expected to have no chunks.
+    """
+    text_docs: list[str] = []
+    picture_docs: list[str] = []
+    for doc_id in no_chunk_ids:
+        labels = labels_by_doc.get(doc_id, set())
+        if any(label not in _NON_BODY_LABELS for label in labels):
+            text_docs.append(doc_id)
+        elif "picture" in labels:
+            picture_docs.append(doc_id)
+
+    results: list[CheckResult] = []
+    if text_docs:
+        results.append(
+            CheckResult(
+                name="documents_text_no_chunks",
+                severity=Severity.WARN,
+                message=f"{len(text_docs)} document(s) have text content but no chunks.",
+                remediation="haiku-rag rebuild",
+                details=_sample(sorted(text_docs)),
+            )
+        )
+    if picture_docs and supports_images:
+        results.append(
+            CheckResult(
+                name="documents_pictures_no_chunks",
+                severity=Severity.WARN,
+                message=f"{len(picture_docs)} document(s) with pictures have no chunks.",
+                remediation="haiku-rag rebuild",
+                details=_sample(sorted(picture_docs)),
+            )
+        )
+    elif picture_docs:
+        results.append(
+            CheckResult(
+                name="documents_images_unsearchable",
+                severity=Severity.WARN,
+                message=(
+                    f"{len(picture_docs)} image-only document(s) have no chunks; "
+                    "a text-only embedder cannot index images."
+                ),
+                remediation=(
+                    "Set embeddings.model.multimodal: true on a vllm, voyageai, or "
+                    "cohere model and rebuild to index images."
+                ),
+                details=_sample(sorted(picture_docs)),
+            )
+        )
+    if not results:
+        results.append(
+            CheckResult(
+                name="documents_without_chunks",
+                severity=Severity.OK,
+                message="Every document with content has chunks.",
+            )
+        )
+    return results
+
+
+async def _check_fts_coverage(store: Store) -> CheckResult:
+    """An FTS index that covers no rows, and a populated table with no FTS
+    index at all, both make lance serve results unsorted by score with
+    matching rows dropped. optimize indexes the rows of an index that
+    exists; it never creates one that is absent."""
+    from lancedb.index import FTS
+
+    uncovered: list[str] = []
+    missing: list[str] = []
+    for table_name, table in store._tables().items():
+        declared = [c for c, cfg in index_specs(table_name) if isinstance(cfg, FTS)]
+        if not declared:
+            continue
+        rows = await table.count_rows()
+        if not rows:
+            continue
+        indices = await table.list_indices()
+        for column in declared:
+            index = next(
+                (i for i in indices if column in i.columns and i.index_type == "FTS"),
+                None,
+            )
+            if index is None:
+                missing.append(f"{table_name}.{column}: no index over {rows} rows")
+                continue
+            stats = await table.index_stats(index.name)
+            if stats is None or stats.num_indexed_rows == 0:
+                uncovered.append(f"{table_name}.{column}: 0 of {rows} rows indexed")
+    if missing or uncovered:
+        return CheckResult(
+            name="fts_index_coverage",
+            severity=Severity.FAIL,
+            message=(
+                "Full-text search index does not cover its rows; FTS and "
+                "hybrid results are unsorted and incomplete."
+            ),
+            remediation=(
+                "Run 'haiku-rag rebuild --embed-only' to build the index."
+                if missing
+                else "Run 'haiku-rag vacuum' to index the rows."
+            ),
+            details=missing + uncovered,
+        )
+    return CheckResult(
+        name="fts_index_coverage",
+        severity=Severity.OK,
+        message="Full-text search indexes are present and cover rows.",
+    )
+
+
+async def _column_values(table, column: str) -> list:
+    rows = await table.query().select([column]).to_list()
+    return [row[column] for row in rows]
+
+
+class _DuplicateFamily(BaseModel):
+    members: list[str]
+    keep: str
+    similarity: dict[str, float]
+    sizes: dict[str, int]
+
+
+def _duplicate_families(
+    doc_ids: list[str],
+    centroids: np.ndarray,
+    counts: np.ndarray,
+    cfg: DuplicateDetectionConfig,
+) -> list[_DuplicateFamily]:
+    """Cluster documents whose embedding centroids are nearly identical.
+
+    ``centroids`` holds one summed (unnormalized) centroid per document and
+    ``counts`` its embedded-chunk count. Documents below the small-document
+    floor are dropped; the rest are normalized and clustered by union-find over
+    pairwise cosine above ``similarity_threshold``. One family per component,
+    each carrying every member's highest cosine to another member.
+    """
+    centroids = np.asarray(centroids, dtype=np.float32)
+    counts = np.asarray(counts)
+    norms = np.linalg.norm(centroids, axis=1)
+    eligible = np.nonzero((counts >= cfg.min_chunks) & (norms > 0))[0]
+    if eligible.size < 2:
+        return []
+    unit = centroids[eligible] / norms[eligible][:, None]
+    ids = [doc_ids[i] for i in eligible]
+    sizes = {doc_ids[i]: int(counts[i]) for i in eligible}
+    n = len(ids)
+
+    # Pairwise cosine, block-wise to avoid a full D×D matrix at once. Each row
+    # only compares against higher-indexed documents (upper triangle). Cluster
+    # with union-find and keep only each document's best similarity to a twin —
+    # a self-similar corpus forms one clique, so storing every pair would be
+    # O(D²) objects.
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    best = np.zeros(n, dtype=np.float32)
+    linked = False
+    block = 512
+    for start in range(0, n, block):
+        sims = unit[start : start + block] @ unit.T
+        for row in range(sims.shape[0]):
+            gi = start + row
+            cols = (
+                gi + 1 + np.nonzero(sims[row, gi + 1 :] >= cfg.similarity_threshold)[0]
+            )
+            if cols.size == 0:
+                continue
+            linked = True
+            row_best = sims[row, cols]
+            best[gi] = max(best[gi], float(row_best.max()))
+            best[cols] = np.maximum(best[cols], row_best)
+            ri = find(gi)
+            for gj in cols.tolist():
+                parent[find(gj)] = ri
+    if not linked:
+        return []
+
+    components: dict[int, list[int]] = {}
+    for idx in range(n):
+        components.setdefault(find(idx), []).append(idx)
+
+    families: list[_DuplicateFamily] = []
+    for indices in components.values():
+        if len(indices) < 2:
+            continue
+        members = sorted(ids[i] for i in indices)
+        # Largest document (most chunks) is the one to keep; smallest id on a tie.
+        keep = min(members, key=lambda d: (-sizes[d], d))
+        families.append(
+            _DuplicateFamily(
+                members=members,
+                keep=keep,
+                similarity={ids[i]: round(float(best[i]), 3) for i in indices},
+                sizes={d: sizes[d] for d in members},
+            )
+        )
+    return sorted(families, key=lambda f: f.members)
+
+
+def _common_path_prefix(labels: list[str]) -> str:
+    """Longest shared prefix across labels, trimmed to a path boundary.
+
+    Returns "" unless the shared prefix is long enough to be worth factoring out
+    of every line (deep URI trees are otherwise unreadable).
+    """
+    if len(labels) < 2:  # pragma: no cover - families always have >=2 members
+        return ""
+    lo, hi = min(labels), max(labels)
+    end = 0
+    while end < len(lo) and lo[end] == hi[end]:
+        end += 1
+    cut = lo.rfind("/", 0, end)
+    return lo[: cut + 1] if cut > 16 else ""
+
+
+def _write_duplicates_out(
+    path: Path, families: list[_DuplicateFamily], label: Callable[[str], str]
+) -> None:
+    """One block per group; ``keep_suggested`` marks the document to keep and
+    ``similarity`` is the highest centroid cosine to another group member."""
+    groups = []
+    for n, family in enumerate(families, start=1):
+        groups.append(
+            {
+                "group": n,
+                "keep": family.keep,
+                "documents": [
+                    {
+                        "document_id": member,
+                        "document": label(member),
+                        "chunks": family.sizes[member],
+                        "similarity": family.similarity[member],
+                        "keep_suggested": member == family.keep,
+                    }
+                    for member in family.members
+                ],
+            }
+        )
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump({"groups": groups}, handle, sort_keys=False, allow_unicode=True)
+
+
+def _check_duplicate_documents(
+    doc_ids: list[str],
+    centroids: np.ndarray,
+    counts: np.ndarray,
+    uri_by_doc: Mapping[str, str | None],
+    title_by_doc: Mapping[str, str | None],
+    cfg: DuplicateDetectionConfig,
+    yaml_path: Path | None = None,
+) -> CheckResult:
+    families = _duplicate_families(doc_ids, centroids, counts, cfg)
+
+    def label(doc_id: str) -> str:
+        return uri_by_doc.get(doc_id) or title_by_doc.get(doc_id) or doc_id
+
+    if yaml_path is not None:
+        _write_duplicates_out(yaml_path, families, label)
+
+    if not families:
+        return CheckResult(
+            name="duplicate_documents",
+            severity=Severity.OK,
+            message="No near-duplicate documents detected.",
+        )
+
+    # The terminal report is a summary: show the first few groups whole and
+    # point at the YAML export for the rest. One block per shown group — a
+    # header, each member on its own numbered line, then a compact similarity line.
+    shown = families[:_SAMPLE_LIMIT]
+    prefix = _common_path_prefix([label(m) for f in shown for m in f.members])
+
+    def short(doc_id: str) -> str:
+        text = label(doc_id)
+        return text[len(prefix) :] if prefix and text.startswith(prefix) else text
+
+    details: list[str] = []
+    if prefix:
+        details.append(f"common path: {prefix}")
+    for n, family in enumerate(shown, start=1):
+        number = {member: i for i, member in enumerate(family.members, start=1)}
+        details.append(
+            f"group {n} — {len(family.members)} docs, keep #{number[family.keep]}:"
+        )
+        for member in family.members:
+            details.append(f"  #{number[member]} {short(member)}")
+        sims = ", ".join(
+            f"#{number[m]} {family.similarity[m]:.0%}" for m in family.members
+        )
+        details.append(f"  similarity: {sims}")
+    if len(families) > len(shown):
+        details.append(
+            f"... (+{len(families) - len(shown)} more groups; "
+            "use --duplicates-out to export all)"
+        )
+
+    total_docs = sum(len(f.members) for f in families)
+    return CheckResult(
+        name="duplicate_documents",
+        severity=Severity.WARN,
+        message=(
+            f"{len(families)} group(s) of near-identical documents "
+            f"(potential duplicates), {total_docs} documents."
+        ),
+        remediation=(
+            "Review each group and remove redundant copies; duplication may be intentional."
+        ),
+        details=details,
+    )
+
+
+def _check_document_meta_parity(
+    doc_ids: set[str], meta_doc_ids: set[str]
+) -> CheckResult:
+    """documents <-> document_meta must be 1:1."""
+    orphan_docs = doc_ids - meta_doc_ids
+    orphan_meta = meta_doc_ids - doc_ids
+    if not (orphan_docs or orphan_meta):
+        return CheckResult(
+            name="document_meta_parity",
+            severity=Severity.OK,
+            message="documents and document_meta are consistent.",
+        )
+    details = [f"document with no meta: {d}" for d in _sample(sorted(orphan_docs))]
+    details += [f"meta with no document: {d}" for d in _sample(sorted(orphan_meta))]
+    return CheckResult(
+        name="document_meta_parity",
+        severity=Severity.FAIL,
+        message="documents and document_meta are out of sync.",
+        remediation="haiku-rag rebuild",
+        details=details,
+    )
+
+
+def _check_orphaned_chunks(chunk_doc_ids: set[str], doc_ids: set[str]) -> CheckResult:
+    """Chunks referencing a document that no longer exists."""
+    orphans = chunk_doc_ids - doc_ids
+    return CheckResult(
+        name="orphaned_chunks",
+        severity=Severity.FAIL if orphans else Severity.OK,
+        message=(
+            "Chunks reference missing documents." if orphans else "No orphaned chunks."
+        ),
+        remediation="haiku-rag rebuild" if orphans else None,
+        details=_sample(sorted(orphans)),
+    )
+
+
+def _check_orphaned_items(item_doc_ids: set[str], doc_ids: set[str]) -> CheckResult:
+    """Document items referencing a document that no longer exists."""
+    orphans = item_doc_ids - doc_ids
+    return CheckResult(
+        name="orphaned_document_items",
+        severity=Severity.FAIL if orphans else Severity.OK,
+        message=(
+            "Document items reference missing documents."
+            if orphans
+            else "No orphaned document items."
+        ),
+        remediation="haiku-rag rebuild" if orphans else None,
+        details=_sample(sorted(orphans)),
+    )
+
+
+def _check_documents_without_items(
+    doc_ids: set[str], chunk_doc_ids: set[str], item_doc_ids: set[str]
+) -> CheckResult:
+    """A chunked document must have items; one without them is corrupt. Empty
+    documents legitimately have neither, so only chunked ones are flagged."""
+    missing = (doc_ids & chunk_doc_ids) - item_doc_ids
+    return CheckResult(
+        name="documents_without_items",
+        severity=Severity.WARN if missing else Severity.OK,
+        message=(
+            f"{len(missing)} chunked document(s) have no document items."
+            if missing
+            else "Every chunked document has document items."
+        ),
+        remediation="haiku-rag rebuild" if missing else None,
+        details=_sample(sorted(missing)),
+    )
+
+
+def _check_dangling_item_refs(
+    chunk_rows: list[dict], self_refs_by_doc: dict[str, set[str]]
+) -> CheckResult:
+    """Chunk metadata may reference self_refs that do not exist for that document."""
+    dangling: list[str] = []
+    for row in chunk_rows:
+        refs = json.loads(row.get("metadata") or "{}").get("doc_item_refs") or []
+        known = self_refs_by_doc.get(row["document_id"], set())
+        if any(ref not in known for ref in refs):
+            dangling.append(row["id"])
+    return CheckResult(
+        name="dangling_doc_item_refs",
+        severity=Severity.FAIL if dangling else Severity.OK,
+        message=(
+            f"{len(dangling)} chunk(s) reference missing document items."
+            if dangling
+            else "All chunk doc_item_refs resolve."
+        ),
+        remediation="haiku-rag rebuild" if dangling else None,
+        details=_sample(dangling),
+    )
+
+
+def _check_vector_dimension(stored_dim: int | None, actual_dim: int) -> CheckResult:
+    if stored_dim and stored_dim != actual_dim:
+        return CheckResult(
+            name="vector_dimension",
+            severity=Severity.FAIL,
+            message=(
+                f"Chunk vector size {actual_dim} does not match stored "
+                f"vector_dim {stored_dim}."
+            ),
+            remediation="haiku-rag rebuild",
+        )
+    return CheckResult(
+        name="vector_dimension",
+        severity=Severity.OK,
+        message=f"Chunk vectors are {actual_dim}-dimensional.",
+    )
+
+
+def _check_unembedded_chunks(id_column, embedded: "np.ndarray") -> CheckResult:
+    """All-zero vectors, reported as a count with a few sampled ids so a large
+    corpus never materializes every chunk id."""
+    zero_rows = np.nonzero(~embedded)[0]
+    zero_count = int(zero_rows.size)
+    sample = [id_column[int(i)].as_py() for i in zero_rows[:_SAMPLE_LIMIT]]
+    if zero_count > _SAMPLE_LIMIT:
+        sample.append(f"... (+{zero_count - _SAMPLE_LIMIT} more)")
+    return CheckResult(
+        name="unembedded_chunks",
+        severity=Severity.WARN if zero_count else Severity.OK,
+        message=(
+            f"{zero_count} chunk(s) have an all-zero (unembedded) vector."
+            if zero_count
+            else "All chunks are embedded."
+        ),
+        remediation="haiku-rag rebuild --embed-only" if zero_count else None,
+        details=sample,
+    )
+
+
+def _document_centroids(
+    document_id_column, vectors: "np.ndarray", embedded: "np.ndarray", dim: int
+) -> tuple[list[str], "np.ndarray", "np.ndarray"]:
+    """Reduce each document's chunk vectors to one summed centroid.
+
+    Dictionary-encode the document ids into integer codes, then sum each
+    document's embedded rows in a single pass per document — no second full copy
+    of the vector matrix. Returns (document ids, summed centroids, chunk counts);
+    the caller normalizes.
+    """
+    encoded = document_id_column.combine_chunks().dictionary_encode()
+    ids = encoded.dictionary.to_pylist()
+    codes = encoded.indices.to_numpy(zero_copy_only=False)
+    centroids = np.zeros((len(ids), dim), dtype=np.float32)
+    counts = np.zeros(len(ids), dtype=np.int64)
+    order = np.argsort(codes, kind="stable")
+    bounds = np.searchsorted(codes, np.arange(len(ids) + 1), sorter=order)
+    for d in range(len(ids)):
+        rows = order[bounds[d] : bounds[d + 1]]
+        rows = rows[embedded[rows]]
+        counts[d] = rows.size
+        if rows.size:
+            centroids[d] = vectors[rows].sum(axis=0)
+    return ids, centroids, counts
+
+
+def _check_picture_data(
+    missing_picture_docs: list[str], content_type_by_doc: dict[str, str]
+) -> CheckResult:
+    """Pictures from image/PDF sources should carry raster bytes. Pictures that
+    are external image references in a text document (markdown, HTML) have no
+    embedded bytes by nature, so a missing raster there is expected."""
+    real_missing = [
+        doc_id
+        for doc_id in missing_picture_docs
+        if not content_type_by_doc.get(doc_id, "").startswith("text/")
+    ]
+    return CheckResult(
+        name="picture_data",
+        severity=Severity.WARN if real_missing else Severity.OK,
+        message=(
+            f"{len(real_missing)} picture item(s) in image/PDF documents "
+            "have no image data."
+            if real_missing
+            else "Pictures that should carry image data have it."
+        ),
+        remediation="haiku-rag rebuild" if real_missing else None,
+        details=_sample(sorted(set(real_missing))),
+    )
+
+
+def _check_settings_row(total_settings: int, canonical: int) -> CheckResult:
+    """Settings must hold exactly one canonical row."""
+    if total_settings == 0 or canonical != 1:
+        return CheckResult(
+            name="settings_row",
+            severity=Severity.FAIL,
+            message=(
+                f"Expected exactly one 'settings' row, found {canonical} "
+                f"(of {total_settings} total)."
+            ),
+            remediation="haiku-rag migrate",
+        )
+    return CheckResult(
+        name="settings_row",
+        severity=Severity.OK,
+        message="Settings row is present.",
+    )
+
+
+def _check_pending_migrations(stored_version: str) -> CheckResult:
+    pending = (
+        get_pending_upgrades(stored_version) if stored_version != "unknown" else []
+    )
+    return CheckResult(
+        name="pending_migrations",
+        severity=Severity.WARN if pending else Severity.OK,
+        message=(
+            f"{len(pending)} migration(s) pending (db version {stored_version})."
+            if pending
+            else f"Database is up to date (version {stored_version})."
+        ),
+        remediation="haiku-rag migrate" if pending else None,
+        details=[f"{step.version}: {step.description or ''}" for step in pending],
+    )
+
+
+async def run_db_checks(
+    store: Store,
+    config: AppConfig,
+    stats: dict,
+    duplicates_out: Path | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> list[CheckResult]:
+    """Referential and content-integrity checks against an open read-only Store.
+
+    Assumes all required tables exist (the caller short-circuits otherwise).
+    """
+    notify = on_progress or (lambda _label: None)
+    results: list[CheckResult] = []
+
+    notify("Reading document records")
+    doc_ids = set(await _column_values(store.documents_table, "id"))
+    meta_rows = (
+        await store.document_meta_table.query()
+        .select(["id", "metadata", "uri", "title"])
+        .to_list()
+    )
+    meta_doc_ids = {row["id"] for row in meta_rows}
+    content_type_by_doc = {
+        row["id"]: json.loads(row.get("metadata") or "{}").get("content_type", "")
+        for row in meta_rows
+    }
+    uri_by_doc = {row["id"]: row.get("uri") for row in meta_rows}
+    title_by_doc = {row["id"]: row.get("title") for row in meta_rows}
+
+    notify("Reading chunks")
+    chunk_rows = (
+        await store.chunks_table.query()
+        .select(["id", "document_id", "metadata"])
+        .to_list()
+    )
+    chunk_doc_ids = {row["document_id"] for row in chunk_rows}
+
+    notify("Reading document items")
+    item_rows = (
+        await store.document_items_table.query()
+        .select(["document_id", "self_ref", "label"])
+        .to_list()
+    )
+    item_doc_ids = {row["document_id"] for row in item_rows}
+    self_refs_by_doc: dict[str, set[str]] = {}
+    labels_by_doc: dict[str, set[str]] = {}
+    for row in item_rows:
+        self_refs_by_doc.setdefault(row["document_id"], set()).add(row["self_ref"])
+        labels_by_doc.setdefault(row["document_id"], set()).add(row["label"])
+
+    notify("Checking index coverage")
+    results.append(await _check_fts_coverage(store))
+
+    notify("Checking referential integrity")
+    results.append(_check_document_meta_parity(doc_ids, meta_doc_ids))
+    results.append(_check_orphaned_chunks(chunk_doc_ids, doc_ids))
+    results.append(_check_orphaned_items(item_doc_ids, doc_ids))
+
+    notify("Checking document chunking")
+    results += _classify_unchunked(
+        doc_ids - chunk_doc_ids, labels_by_doc, store.embedder.supports_images
+    )
+    results.append(_check_documents_without_items(doc_ids, chunk_doc_ids, item_doc_ids))
+
+    notify("Checking chunk references")
+    results.append(_check_dangling_item_refs(chunk_rows, self_refs_by_doc))
+
+    notify("Scanning chunk vectors")
+    # Vector dimension, unembedded vectors and duplicate detection share one
+    # scan of the vector column — the heaviest read on large corpora.
+    arrow = (
+        await store.chunks_table.query()
+        .select(["id", "vector", "document_id"])
+        .to_arrow()
+    )
+    stored = store.stored_settings
+    stored_dim = stored.get("embeddings", {}).get("model", {}).get("vector_dim")
+    actual_dim = arrow.schema.field("vector").type.list_size
+    results.append(_check_vector_dimension(stored_dim, actual_dim))
+
+    # Reshape the Arrow fixed-size-list child buffer directly into an (N, dim)
+    # float32 matrix. Going through to_pylist() would box N*dim Python floats
+    # (tens of GB and most of the wall-clock on large corpora); the stored
+    # vectors are already float32, so this keeps the layout and the dtype.
+    vec_col = arrow.column("vector").combine_chunks()
+    vectors = vec_col.values.to_numpy(zero_copy_only=False).reshape(-1, actual_dim)
+    embedded = vectors.any(axis=1) if vectors.size else np.zeros(0, dtype=bool)
+
+    results.append(_check_unembedded_chunks(arrow.column("id"), embedded))
+
+    notify("Detecting near-duplicate documents")
+    centroid_doc_ids, centroids, counts = _document_centroids(
+        arrow.column("document_id"), vectors, embedded, actual_dim
+    )
+    # The matrix is the largest object here; drop it before clustering.
+    del vectors
+    results.append(
+        _check_duplicate_documents(
+            centroid_doc_ids,
+            centroids,
+            counts,
+            uri_by_doc,
+            title_by_doc,
+            config.doctor.duplicates,
+            yaml_path=duplicates_out,
+        )
+    )
+
+    notify("Checking picture data")
+    missing_picture_docs = [
+        row["document_id"]
+        for row in await store.document_items_table.query()
+        .select(["document_id"])
+        .where("label = 'picture' AND picture_data IS NULL")
+        .to_list()
+    ]
+    results.append(_check_picture_data(missing_picture_docs, content_type_by_doc))
+
+    notify("Checking settings and indexes")
+    total_settings = await store.settings_table.count_rows()
+    canonical = len(
+        await store.settings_table.query().where("id = 'settings'").to_list()
+    )
+    results.append(_check_settings_row(total_settings, canonical))
+    results.append(_check_embedding_drift(stored, config))
+    results.append(_check_pending_migrations(str(stored.get("version", "unknown"))))
+
+    results.append(_check_vector_index(stats))
+
+    return results
+
+
+def _check_embedding_drift(stored: dict, config: AppConfig) -> CheckResult:
+    stored_model = stored.get("embeddings", {}).get("model", {})
+    current_model = config.embeddings.model
+    if not stored_model:
+        return CheckResult(
+            name="embedding_drift",
+            severity=Severity.OK,
+            message="No stored embedding identity to compare.",
+        )
+
+    stored_dim = stored_model.get("vector_dim")
+    if stored_dim and stored_dim != current_model.vector_dim:
+        return CheckResult(
+            name="embedding_drift",
+            severity=Severity.FAIL,
+            message=(
+                f"Embedding vector_dim differs: stored {stored_dim} -> "
+                f"config {current_model.vector_dim}."
+            ),
+            remediation="haiku-rag rebuild",
+        )
+
+    drift: list[str] = []
+    if stored_model.get("provider") not in (None, current_model.provider):
+        drift.append(
+            f"provider: {stored_model['provider']} -> {current_model.provider}"
+        )
+    if stored_model.get("name") not in (None, current_model.name):
+        drift.append(f"name: {stored_model['name']} -> {current_model.name}")
+    if drift:
+        return CheckResult(
+            name="embedding_drift",
+            severity=Severity.WARN,
+            message="Embedding identity differs from config (vector_dim matches).",
+            remediation="haiku-rag rebuild --set-embedder",
+            details=drift,
+        )
+    return CheckResult(
+        name="embedding_drift",
+        severity=Severity.OK,
+        message="Embedding identity matches the stored settings.",
+    )
+
+
+def _check_vector_index(stats: dict) -> CheckResult:
+    chunks = stats["chunks"]
+    num_chunks = chunks.get("num_rows", 0)
+    if not chunks.get("has_vector_index"):
+        if num_chunks >= 100_000:
+            return CheckResult(
+                name="vector_index",
+                severity=Severity.WARN,
+                message=(
+                    "No vector index on a large collection; "
+                    "similarity search scans every chunk and may be slow."
+                ),
+                remediation="haiku-rag create-index",
+            )
+        return CheckResult(
+            name="vector_index",
+            severity=Severity.OK,
+            message="No vector index; similarity search is exact (brute-force).",
+        )
+    unindexed = chunks.get("num_unindexed_rows", 0)
+    if unindexed > 0:
+        return CheckResult(
+            name="vector_index",
+            severity=Severity.WARN,
+            message=f"{unindexed} chunk(s) are not in the vector index.",
+            remediation="haiku-rag create-index",
+        )
+    return CheckResult(
+        name="vector_index",
+        severity=Severity.OK,
+        message="Vector index covers all chunks.",
+    )
+
+
+def _resolve_endpoint(
+    provider: str, base_url: str | None, ollama_base: str
+) -> tuple[str, str, str] | str | None:
+    """Map a model's provider to a probe target.
+
+    Returns ``(probe_url, kind, display)``, the literal ``"local"`` for an
+    in-process model, or ``None`` for a SaaS provider covered by the API-key
+    check.
+    """
+    if provider == "ollama":
+        base = (base_url or ollama_base).rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3].rstrip("/")
+        return f"{base}/api/tags", "ollama", base
+    if provider == "vllm":
+        base = (base_url or "http://localhost:8000/v1").rstrip("/")
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        return f"{base}/models", "openai", base
+    if provider == "openai" and base_url:
+        base = base_url.rstrip("/")
+        return f"{base}/models", "openai", base
+    if provider in _LOCAL_PROVIDERS:
+        return "local"
+    return None
+
+
+def _provider_targets(
+    config: AppConfig,
+) -> tuple[dict[str, dict], set[str]]:
+    """Collect probe targets (keyed by probe URL) and local-only providers."""
+    targets: dict[str, dict] = {}
+    local: set[str] = set()
+    ollama_base = config.providers.ollama.base_url
+
+    def add_model(model: ModelConfig | EmbeddingModelConfig) -> None:
+        resolved = _resolve_endpoint(model.provider, model.base_url, ollama_base)
+        if resolved is None:
+            return
+        if resolved == "local":
+            local.add(model.provider)
+            return
+        probe_url, kind, display = resolved
+        entry = targets.setdefault(
+            probe_url,
+            {"kind": kind, "display": display, "models": set(), "headers": {}},
+        )
+        # A secured endpoint answers the probe only with its key. Models sharing
+        # a probe URL share the endpoint, so the first key configured for it wins.
+        if model.api_key and not entry["headers"]:
+            entry["headers"] = {"Authorization": f"Bearer {model.api_key}"}
+        if model.name:
+            entry["models"].add(model.name)
+
+    proc = config.processing
+    if proc.converter == "docling-serve" or proc.chunker == "docling-serve":
+        docling_key = config.providers.docling_serve.api_key
+        headers = {"X-Api-Key": docling_key} if docling_key else {}
+        for url in config.providers.docling_serve.base_urls:
+            base = url.rstrip("/")
+            targets.setdefault(
+                f"{base}/health",
+                {
+                    "kind": "docling-serve",
+                    "display": base,
+                    "models": set(),
+                    "headers": headers,
+                },
+            )
+
+    for model in _active_models(config):
+        add_model(model)
+
+    return targets, local
+
+
+def _model_present(expected: str, available: set[str]) -> bool:
+    if expected in available:
+        return True
+    if ":" not in expected:
+        return any(a.split(":", 1)[0] == expected for a in available)
+    return False
+
+
+async def _probe_endpoint(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str]
+) -> tuple[bool, str | None, dict | None]:
+    try:
+        response = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        return False, str(exc), None
+    if not response.is_success:
+        return False, f"HTTP {response.status_code}", None
+    try:
+        return True, None, response.json()
+    except ValueError:
+        return True, None, None
+
+
+def _endpoint_result(
+    entry: dict, reachable: bool, error: str | None, payload: dict | None
+) -> CheckResult:
+    kind = entry["kind"]
+    display = entry["display"]
+    name = f"provider:{display}"
+    if not reachable:
+        return CheckResult(
+            name=name,
+            severity=Severity.FAIL,
+            message=f"{kind} at {display} is unreachable.",
+            remediation="Start the service or fix the configured base_url.",
+            details=[error] if error else [],
+        )
+    if kind == "ollama":
+        available = {m.get("name", "") for m in (payload or {}).get("models", [])}
+        missing = [
+            model
+            for model in sorted(entry["models"])
+            if not _model_present(model, available)
+        ]
+        if missing:
+            return CheckResult(
+                name=name,
+                severity=Severity.WARN,
+                message=f"ollama at {display} is reachable but missing model(s).",
+                remediation="ollama pull <model>",
+                details=missing,
+            )
+    return CheckResult(
+        name=name,
+        severity=Severity.OK,
+        message=f"{kind} at {display} is reachable.",
+    )
+
+
+async def run_provider_checks(
+    config: AppConfig, on_progress: Callable[[str], None] | None = None
+) -> list[CheckResult]:
+    """Probe the external endpoints the current config actually uses."""
+    targets, local = _provider_targets(config)
+
+    results: list[CheckResult] = []
+    if targets:
+        if on_progress is not None:
+            on_progress("Probing provider endpoints")
+        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_S) as client:
+            probes = await asyncio.gather(
+                *(
+                    _probe_endpoint(client, url, targets[url]["headers"])
+                    for url in targets
+                )
+            )
+        for url, (reachable, error, payload) in zip(targets, probes):
+            results.append(_endpoint_result(targets[url], reachable, error, payload))
+
+    for provider in sorted(local):
+        results.append(
+            CheckResult(
+                name=f"provider:{provider}",
+                severity=Severity.OK,
+                message=f"{provider}: local model, nothing to probe.",
+            )
+        )
+    return results
+
+
+async def run_doctor(
+    config: AppConfig,
+    location: Path | str,
+    environ: dict[str, str],
+    duplicates_out: Path | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> DoctorReport:
+    """Open the database read-only and run every diagnostic check.
+
+    Opens with validation and migration checks skipped so a drifted or
+    pre-migration database can still be diagnosed rather than refusing to open.
+    """
+    notify = on_progress or (lambda _label: None)
+    notify("Inspecting tables")
+    db = await connect_lancedb(location, config)
+    stats = await get_database_stats(db)
+
+    results: list[CheckResult] = []
+    if not any(entry["exists"] for entry in stats.values()):
+        results.append(
+            CheckResult(
+                name="tables_present",
+                severity=Severity.FAIL,
+                message="Database is empty.",
+                remediation="haiku-rag init",
+            )
+        )
+    else:
+        results.append(_check_tables_present(stats))
+        missing = [name for name in REQUIRED_TABLES if not stats[name]["exists"]]
+        if not missing:
+            async with Store(
+                location,
+                config=config,
+                skip_validation=True,
+                read_only=True,
+                skip_migration_check=True,
+            ) as store:
+                results += await run_db_checks(
+                    store,
+                    config,
+                    stats,
+                    duplicates_out=duplicates_out,
+                    on_progress=on_progress,
+                )
+
+    notify("Checking API keys")
+    results.append(_check_api_keys(config, environ))
+    results += await run_provider_checks(config, on_progress=on_progress)
+    return DoctorReport(results=results)

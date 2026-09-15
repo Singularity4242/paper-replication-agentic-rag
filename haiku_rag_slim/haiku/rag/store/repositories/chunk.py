@@ -1,0 +1,485 @@
+import json
+import logging
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+if TYPE_CHECKING:
+    from lancedb.query import AsyncQueryBase
+
+from lancedb.rerankers import RRFReranker
+
+from haiku.rag.store.engine import Store
+from haiku.rag.store.models.chunk import Chunk, SearchType
+from haiku.rag.store.schema import ensure_indexes, query_to_pydantic
+from haiku.rag.utils import escape_sql_string
+
+logger = logging.getLogger(__name__)
+
+
+class ChunkRepository:
+    """Repository for Chunk operations."""
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+        self.embedder = store.embedder
+        self._fts_coverage_checked = False
+
+    async def _warn_if_fts_uncovered(self) -> None:
+        """An FTS index covering no rows makes lance serve a broken scan path:
+        results unsorted by score, with matching documents dropped. Checked
+        on the first search that uses the index, once per repository after
+        the table holds rows."""
+        if self._fts_coverage_checked:
+            return
+        try:
+            indices = await self.store.chunks_table.list_indices()
+            index = next(
+                (
+                    i
+                    for i in indices
+                    if "content_fts" in i.columns and i.index_type == "FTS"
+                ),
+                None,
+            )
+            stats = (
+                await self.store.chunks_table.index_stats(index.name) if index else None
+            )
+            if stats is not None and stats.num_indexed_rows > 0:
+                self._fts_coverage_checked = True
+                return
+            # An empty table proves nothing; check again once it has rows.
+            if not await self.store.chunks_table.count_rows():
+                return
+        except Exception:
+            self._fts_coverage_checked = True
+            logger.debug("FTS coverage check failed", exc_info=True)
+            return
+        self._fts_coverage_checked = True
+        if index is None:
+            logger.warning(
+                "No full-text search index; FTS and hybrid results are "
+                "degraded. Run 'haiku-rag rebuild --embed-only'."
+            )
+            return
+        logger.warning(
+            "Full-text search index covers 0 rows; FTS and hybrid results "
+            "are degraded. Run 'haiku-rag vacuum'."
+        )
+
+    def _contextualize_content(self, chunk: Chunk) -> str:
+        """Generate contextualized content for FTS by prepending headings."""
+        meta = chunk.get_chunk_metadata()
+        if meta.headings:
+            return "\n".join(meta.headings) + "\n" + chunk.content
+        return chunk.content
+
+    def _to_record(self, chunk: Chunk, chunk_id: str):
+        assert chunk.document_id is not None
+        assert chunk.embedding is not None
+        return self.store.ChunkRecord(
+            id=chunk_id,
+            document_id=chunk.document_id,
+            content=chunk.content,
+            content_fts=self._contextualize_content(chunk),
+            metadata=json.dumps(
+                {k: v for k, v in chunk.metadata.items() if k != "order"}
+            ),
+            order=int(chunk.order),
+            vector=chunk.embedding,
+        )
+
+    async def create(self, entity: Chunk | list[Chunk]) -> Chunk | list[Chunk]:
+        """Create one or more chunks in the database.
+
+        Chunks must have embeddings set before calling this method.
+        Use haiku.rag.client.processing.ensure_chunks_embedded() to embed
+        chunks if needed.
+        """
+        self.store._assert_writable()
+        if isinstance(entity, Chunk):
+            assert entity.document_id, "Chunk must have a document_id to be created"
+            assert entity.embedding is not None, "Chunk must have an embedding"
+
+            chunk_id = str(uuid4())
+            chunk_record = self._to_record(entity, chunk_id)
+
+            await self.store.chunks_table.add([chunk_record])
+            entity.id = chunk_id
+            await ensure_indexes(self.store.chunks_table, "chunks")
+
+            return entity
+
+        chunks = entity
+        if not chunks:
+            return []
+
+        # Validate all chunks have document_id and embedding
+        for chunk in chunks:
+            assert chunk.document_id, "All chunks must have a document_id to be created"
+            assert chunk.embedding is not None, "All chunks must have embeddings"
+
+        chunk_records = []
+        for chunk in chunks:
+            chunk_id = str(uuid4())
+
+            chunk_record = self._to_record(chunk, chunk_id)
+            chunk_records.append(chunk_record)
+            chunk.id = chunk_id
+
+        await self.store.chunks_table.add(chunk_records)
+        await ensure_indexes(self.store.chunks_table, "chunks")
+
+        return chunks
+
+    async def replace_for_document(
+        self, document_id: str, chunks: list[Chunk]
+    ) -> list[Chunk]:
+        """Replace all chunks for a document with one scoped merge operation."""
+        self.store._assert_writable()
+
+        if not chunks:
+            await self.delete_by_document_id(document_id)
+            return []
+
+        for chunk in chunks:
+            assert chunk.document_id == document_id, (
+                "All chunks must belong to the replaced document"
+            )
+            assert chunk.embedding is not None, "All chunks must have embeddings"
+
+        records = []
+        for chunk in chunks:
+            chunk_id = str(uuid4())
+            records.append(self._to_record(chunk, chunk_id))
+            chunk.id = chunk_id
+
+        safe_id = escape_sql_string(document_id)
+        await (
+            self.store.chunks_table.merge_insert(["document_id", "order"])
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .when_not_matched_by_source_delete(f"document_id = '{safe_id}'")
+            .execute(records)
+        )
+        await ensure_indexes(self.store.chunks_table, "chunks")
+        return chunks
+
+    async def get_by_id(self, entity_id: str) -> Chunk | None:
+        """Get a chunk by its ID."""
+        results = await query_to_pydantic(
+            self.store.chunks_table.query().where(f"id = '{entity_id}'").limit(1),
+            self.store.ChunkRecord,
+        )
+
+        if not results:
+            return None
+
+        chunk_record = results[0]
+        md = json.loads(chunk_record.metadata)
+        return Chunk(
+            id=chunk_record.id,
+            document_id=chunk_record.document_id,
+            content=chunk_record.content,
+            metadata=md,
+            order=chunk_record.order,
+        )
+
+    async def list_all(
+        self, limit: int | None = None, offset: int | None = None
+    ) -> list[Chunk]:
+        """List all chunks with optional pagination."""
+        query = self.store.chunks_table.query()
+
+        if offset is not None:
+            query = query.offset(offset)
+        if limit is not None:
+            query = query.limit(limit)
+
+        results = await query_to_pydantic(query, self.store.ChunkRecord)
+
+        chunks: list[Chunk] = []
+        for rec in results:
+            md = json.loads(rec.metadata)
+            chunks.append(
+                Chunk(
+                    id=rec.id,
+                    document_id=rec.document_id,
+                    content=rec.content,
+                    metadata=md,
+                    order=rec.order,
+                )
+            )
+        return chunks
+
+    async def delete_all(self) -> None:
+        """Delete all chunks from the database."""
+        self.store._assert_writable()
+        # Drop and recreate table to clear all data
+        await self.store.db.drop_table("chunks")
+        self.store.chunks_table = await self.store.db.create_table(
+            "chunks", schema=self.store.ChunkRecord
+        )
+        await ensure_indexes(self.store.chunks_table, "chunks")
+
+    async def delete_by_document_id(self, document_id: str) -> bool:
+        """Delete all chunks for a document."""
+        self.store._assert_writable()
+        chunks = await self.get_by_document_id(document_id)
+
+        if not chunks:
+            return False
+
+        await self.store.chunks_table.delete(f"document_id = '{document_id}'")
+        await ensure_indexes(self.store.chunks_table, "chunks")
+        return True
+
+    async def search(
+        self,
+        query: str = "",
+        limit: int = 5,
+        search_type: SearchType = "hybrid",
+        filter: str | None = None,
+        query_vector: list[float] | None = None,
+        with_vectors: bool = False,
+    ) -> list[tuple[Chunk, float]]:
+        """Search for relevant chunks using the specified search method.
+
+        Args:
+            query: Text query. Empty when ``query_vector`` is supplied.
+            limit: Maximum number of results to return.
+            search_type: "vector", "fts", or "hybrid" (default).
+            filter: Optional SQL WHERE clause to filter documents before searching chunks.
+            query_vector: Pre-computed query embedding; when supplied, ``query``
+                is not embedded.
+
+        Returns:
+            List of (chunk, score) tuples ordered by relevance.
+        """
+        if query_vector is None and not query.strip():
+            return []
+
+        chunk_filter: str | None = None
+        if filter:
+            # Translate the document-level filter into a chunk-level
+            # document_id IN (...) clause so LanceDB can combine it with
+            # limit. The previous two-step pattern (materialize top-N,
+            # filter in pandas, head(limit)) silently under-returned
+            # whenever the top-N window lacked `limit` matching chunks.
+            docs_df = await (
+                self.store.document_meta_table.query()
+                .select(["id"])
+                .where(filter)
+                .to_pandas()
+            )
+            if docs_df.empty:
+                return []
+            id_list = ", ".join(f"'{d}'" for d in docs_df["id"])
+            chunk_filter = f"document_id IN ({id_list})"
+
+        if search_type != "vector" and query.strip():
+            await self._warn_if_fts_uncovered()
+
+        if search_type == "fts":
+            results = self.store.chunks_table.query().nearest_to_text(
+                query, columns="content_fts"
+            )
+        else:
+            query_embedding = (
+                query_vector
+                if query_vector is not None
+                else await self.embedder.embed_query(query)
+            )
+            results = (
+                self.store.chunks_table.query()
+                .nearest_to(query_embedding)
+                .column("vector")
+                .distance_type(self.store._config.search.vector_index_metric)
+                .refine_factor(self.store._config.search.vector_refine_factor)
+                .nprobes(self.store._config.search.vector_nprobes)
+            )
+            # An image query has no text to match, so it stays vector-only.
+            if search_type != "vector" and query.strip():
+                results = results.nearest_to_text(query, columns="content_fts").rerank(
+                    RRFReranker()
+                )
+
+        if chunk_filter is not None:
+            results = results.where(chunk_filter)
+        results = results.limit(limit)
+        return await self._process_search_results(results, with_vectors=with_vectors)
+
+    async def get_by_document_id(
+        self,
+        document_id: str,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[Chunk]:
+        """Get chunks for a specific document with optional pagination.
+
+        Args:
+            document_id: The document ID to get chunks for.
+            limit: Maximum number of chunks to return. None for all.
+            offset: Number of chunks to skip. None for no offset.
+
+        Returns:
+            List of chunks ordered by their order field.
+        """
+        query = self.store.chunks_table.query().where(f"document_id = '{document_id}'")
+
+        if offset is not None:
+            query = query.offset(offset)
+        if limit is not None:
+            query = query.limit(limit)
+
+        results = await query_to_pydantic(query, self.store.ChunkRecord)
+
+        doc_rows = await (
+            self.store.document_meta_table.query()
+            .select(["id", "uri", "title", "metadata"])
+            .where(f"id = '{document_id}'")
+            .limit(1)
+            .to_list()
+        )
+
+        doc_uri = doc_rows[0]["uri"] if doc_rows else None
+        doc_title = doc_rows[0]["title"] if doc_rows else None
+        doc_meta = doc_rows[0].get("metadata", "{}") if doc_rows else "{}"
+
+        chunks: list[Chunk] = []
+        for rec in results:
+            md = json.loads(rec.metadata)
+            chunks.append(
+                Chunk(
+                    id=rec.id,
+                    document_id=rec.document_id,
+                    content=rec.content,
+                    metadata=md,
+                    order=rec.order,
+                    document_uri=doc_uri,
+                    document_title=doc_title,
+                    document_meta=json.loads(doc_meta),
+                )
+            )
+
+        chunks.sort(key=lambda c: c.order)
+        return chunks
+
+    async def get_chunk_ids_by_self_ref_grouped(
+        self, document_ids: list[str]
+    ) -> dict[str, dict[str, list[str]]]:
+        """For each document, build a self_ref → [chunk_id, ...] index.
+
+        One query across all requested documents. The map lets items.jsonl
+        rows expose which chunks contain them, so callers can bridge from an
+        item to a `cite`-acceptable chunk_id without a separate search.
+        """
+        from haiku.rag.utils import escape_sql_string
+
+        if not document_ids:
+            return {}
+
+        safe_ids = ", ".join(f"'{escape_sql_string(did)}'" for did in document_ids)
+        rows = await (
+            self.store.chunks_table.query()
+            .select(["id", "document_id", "metadata"])
+            .where(f"document_id IN ({safe_ids})")
+            .to_list()
+        )
+
+        index: dict[str, dict[str, list[str]]] = {}
+        for row in rows:
+            did = row["document_id"]
+            md = json.loads(row.get("metadata") or "{}")
+            refs = md.get("doc_item_refs") or []
+            doc_index = index.setdefault(did, {})
+            for ref in refs:
+                doc_index.setdefault(ref, []).append(row["id"])
+        return index
+
+    async def count_by_document_id(self, document_id: str) -> int:
+        """Count the number of chunks for a specific document."""
+        df = await (
+            self.store.chunks_table.query()
+            .select(["id"])
+            .where(f"document_id = '{document_id}'")
+            .to_pandas()
+        )
+        return len(df)
+
+    async def _process_search_results(
+        self, query_result: "AsyncQueryBase", with_vectors: bool = False
+    ) -> list[tuple[Chunk, float]]:
+        """Process search results into chunks with document info and scores."""
+        import pandas as pd
+
+        def extract_scores(df: pd.DataFrame) -> list[float]:
+            """Extract scores from DataFrame columns based on search type."""
+            if "_distance" in df.columns:
+                # Vector search - convert distance to similarity
+                return ((df["_distance"] + 1).rdiv(1)).clip(lower=0.0).tolist()
+            elif "_relevance_score" in df.columns:
+                # Hybrid search - relevance score (higher is better)
+                return df["_relevance_score"].tolist()
+            elif "_score" in df.columns:
+                # FTS search - score (higher is better)
+                return df["_score"].tolist()
+            else:
+                raise ValueError("Unknown search result format, cannot extract scores")
+
+        df = await query_result.to_pandas()
+
+        scores = extract_scores(df)
+
+        pydantic_results = [
+            self.store.ChunkRecord(
+                id=str(row["id"]),
+                document_id=str(row["document_id"]),
+                content=str(row["content"]),
+                content_fts=str(row.get("content_fts", "")),
+                metadata=str(row["metadata"]),
+                order=int(row["order"]) if "order" in row else 0,
+            )
+            for _, row in df.iterrows()
+        ]
+
+        # Collect all unique document IDs for batch lookup
+        document_ids = list(set(chunk.document_id for chunk in pydantic_results))
+
+        # Batch fetch document metadata (skip content/docling blobs)
+        documents_map: dict[str, dict] = {}
+        if document_ids:
+            id_list = "', '".join(document_ids)
+            where_clause = f"id IN ('{id_list}')"
+            doc_rows = await (
+                self.store.document_meta_table.query()
+                .select(["id", "uri", "title", "metadata"])
+                .where(where_clause)
+                .to_list()
+            )
+            documents_map = {str(row["id"]): row for row in doc_rows}
+
+        # The query projects no columns, so the vectors are already in the
+        # frame; only the federated fusion path reads them, so materializing
+        # per-chunk lists is gated on the caller asking.
+        vectors = (
+            df["vector"].tolist() if with_vectors and "vector" in df.columns else None
+        )
+
+        chunks_with_scores = []
+        for i, chunk_record in enumerate(pydantic_results):
+            doc = documents_map.get(chunk_record.document_id)
+            chunk = Chunk(
+                id=chunk_record.id,
+                document_id=chunk_record.document_id,
+                content=chunk_record.content,
+                metadata=json.loads(chunk_record.metadata),
+                order=chunk_record.order,
+                document_uri=doc["uri"] if doc else None,
+                document_title=doc["title"] if doc else None,
+                document_meta=json.loads(doc.get("metadata", "{}") if doc else "{}"),
+                embedding=list(vectors[i]) if vectors is not None else None,
+            )
+            score = scores[i] if i < len(scores) else 1.0
+            chunks_with_scores.append((chunk, score))
+
+        return chunks_with_scores

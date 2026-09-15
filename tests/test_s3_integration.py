@@ -1,0 +1,183 @@
+# Start the services before running:
+#   docker compose -f tests/docker/docker-compose.yml up -d
+# Stop after:
+#   docker compose -f tests/docker/docker-compose.yml down -v
+
+from contextlib import asynccontextmanager
+from uuid import uuid4
+
+import obstore
+import pytest
+
+from haiku.rag.app import HaikuRAGApp
+from haiku.rag.client import HaikuRAG
+from haiku.rag.client.scope import DatabaseScope
+from haiku.rag.config.models import AppConfig, LanceDBConfig
+from haiku.rag.s3 import make_s3_store
+from haiku.rag.store.engine import ConnectionMode, Store
+from tests.services import reachable
+
+S3_ENDPOINT = "http://localhost:8333"
+S3_BUCKET = "test-bucket"
+S3_STORAGE_OPTIONS = {
+    "endpoint": S3_ENDPOINT,
+    "region": "us-east-1",
+    "allow_http": "true",
+    "aws_access_key_id": "testkey",
+    "aws_secret_access_key": "testsecret",
+}
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not reachable("localhost", 8333),
+        reason="SeaweedFS not running on localhost:8333",
+    ),
+]
+
+
+def _make_config() -> AppConfig:
+    unique_prefix = uuid4().hex[:8]
+    return AppConfig(
+        lancedb=LanceDBConfig(
+            databases={"test": f"s3://{S3_BUCKET}/test-{unique_prefix}"},
+            storage_options=S3_STORAGE_OPTIONS,
+        )
+    )
+
+
+def _uri(config: AppConfig) -> str:
+    """The one configured S3 location."""
+    [uri] = config.lancedb.databases.values()
+    return uri
+
+
+@pytest.fixture
+def config():
+    """A config pointing at a unique S3 prefix, cleaned up after the test.
+
+    SeaweedFS reclaims volume space lazily, so leaving each run's data behind
+    eventually fills the volume server and seals its volumes read-only, which
+    makes every subsequent write block forever.
+    """
+    config = _make_config()
+    yield config
+
+    bucket, _, prefix = _uri(config).removeprefix("s3://").partition("/")
+    store = make_s3_store(bucket, S3_STORAGE_OPTIONS)
+    paths = [obj["path"] for batch in store.list(prefix=f"{prefix}/") for obj in batch]
+    if paths:
+        obstore.delete(store, paths)
+
+
+def _remote_scope(config: AppConfig) -> DatabaseScope:
+    """The configured S3 database.
+
+    These tests name no path, and the assertion pins that the scope resolved to
+    the URI.
+    """
+    scope = DatabaseScope.resolve(config)
+    [ref] = scope.databases
+    assert ref.db_path is None and str(ref.location).startswith("s3://")
+    return scope
+
+
+@asynccontextmanager
+async def _remote_client(config: AppConfig):
+    """A client on the configured S3 database, asserting it went there."""
+    async with HaikuRAG(config=config, create=True) as rag:
+        assert rag.store._connection_mode is ConnectionMode.OBJECT_STORAGE
+        yield rag
+
+
+@pytest.mark.asyncio
+async def test_store_connect_and_create(tmp_path, config):
+    from haiku.rag.store.info import get_database_stats
+
+    async with Store(_uri(config), config=config, create=True) as store:
+        stats = await get_database_stats(store.db)
+        assert stats["documents"]["exists"]
+        assert stats["chunks"]["exists"]
+
+
+@pytest.mark.asyncio
+async def test_store_vacuum(tmp_path, config):
+    async with Store(_uri(config), config=config, create=True) as store:
+        await store.vacuum()
+
+
+@pytest.mark.asyncio
+async def test_store_add_document(tmp_path, config):
+    from haiku.rag.store.info import get_database_stats
+    from haiku.rag.store.schema import DocumentRecord
+
+    async with Store(_uri(config), config=config, create=True) as store:
+        doc = DocumentRecord(content="The quick brown fox jumps over the lazy dog.")
+        await store.documents_table.add([doc])
+
+        stats = await get_database_stats(store.db)
+        assert stats["documents"]["num_rows"] == 1
+
+
+@pytest.mark.asyncio
+async def test_client_create_document(config):
+    async with _remote_client(config) as rag:
+        doc = await rag.create_document(
+            "Python is a programming language.", uri="test://python"
+        )
+        assert doc.id
+        assert doc.uri == "test://python"
+
+
+@pytest.mark.asyncio
+async def test_client_list_documents(config):
+    async with _remote_client(config) as rag:
+        await rag.create_document("First document.", uri="test://first")
+        await rag.create_document("Second document.", uri="test://second")
+
+        docs = await rag.list_documents()
+        assert len(docs) == 2
+
+
+@pytest.mark.asyncio
+async def test_client_search(config):
+    async with _remote_client(config) as rag:
+        await rag.create_document(
+            "The Eiffel Tower is located in Paris, France.", uri="test://eiffel"
+        )
+        results = await rag.search("Eiffel Tower")
+        assert len(results) > 0
+        assert "Eiffel" in results[0].content
+
+
+@pytest.mark.asyncio
+async def test_client_delete_document(config):
+    async with _remote_client(config) as rag:
+        doc = await rag.create_document("Temporary document.", uri="test://temp")
+        await rag.delete_document(doc.id)
+        docs = await rag.list_documents()
+        assert len(docs) == 0
+
+
+@pytest.mark.asyncio
+async def test_app_info(capsys, config):
+    async with _remote_client(config) as rag:
+        await rag.create_document("Info test document.", uri="test://info")
+
+    app = HaikuRAGApp(scope=_remote_scope(config), config=config)
+    await app.info()
+
+    out = capsys.readouterr().out
+    assert "path:" in out
+    assert _uri(config) in out
+    assert "documents: 1" in out
+
+
+@pytest.mark.asyncio
+async def test_app_info_empty_db(capsys, config):
+    app = HaikuRAGApp(scope=_remote_scope(config), config=config)
+    await app.info()
+
+    out = capsys.readouterr().out
+    assert "Database is empty" in out

@@ -1,0 +1,11 @@
+# Data directory
+data/
+
+# Documents directory
+docs/
+
+# Environment file with secrets
+.env
+
+# Local Compose override (dev builds, custom mounts, etc.)
+docker-compose.override.yml

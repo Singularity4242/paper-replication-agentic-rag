@@ -1,0 +1,758 @@
+import hashlib
+
+import httpx
+import pytest
+
+from haiku.rag.sources.base import FileTooLargeError, SourceEventKind
+from haiku.rag.sources.webdav import WebDAVSource, _strip_etag
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ('"abc123"', "abc123"),
+        ('W/"abc123"', "abc123"),
+        ("abc123", "abc123"),
+        ('  W/"abc"  ', "abc"),
+        ("", None),
+        ('""', None),
+        (None, None),
+    ],
+    ids=[
+        "strong_quoted",
+        "weak_marker",
+        "unquoted",
+        "whitespace",
+        "empty",
+        "empty_quotes",
+        "none",
+    ],
+)
+def test_strip_etag(raw, expected):
+    assert _strip_etag(raw) == expected
+
+
+def _transport(handler) -> httpx.MockTransport:
+    return httpx.MockTransport(handler)
+
+
+def _multistatus(*entries: dict) -> bytes:
+    """Build a <multistatus> response. Each entry is a dict like
+    {'href': '/dav/x.md', 'collection': False, 'etag': '"abc"',
+     'last_modified': 'Wed, ...', 'content_type': 'text/markdown'}."""
+    body = ['<?xml version="1.0" encoding="utf-8"?>', '<d:multistatus xmlns:d="DAV:">']
+    for e in entries:
+        body.append("  <d:response>")
+        body.append(f"    <d:href>{e['href']}</d:href>")
+        body.append("    <d:propstat>")
+        body.append("      <d:status>HTTP/1.1 200 OK</d:status>")
+        body.append("      <d:prop>")
+        body.append("        <d:resourcetype>")
+        if e.get("collection"):
+            body.append("          <d:collection/>")
+        body.append("        </d:resourcetype>")
+        if "etag" in e:
+            body.append(f"        <d:getetag>{e['etag']}</d:getetag>")
+        if "last_modified" in e:
+            body.append(
+                f"        <d:getlastmodified>{e['last_modified']}</d:getlastmodified>"
+            )
+        if "content_type" in e:
+            body.append(
+                f"        <d:getcontenttype>{e['content_type']}</d:getcontenttype>"
+            )
+        body.append("      </d:prop>")
+        body.append("    </d:propstat>")
+        body.append("  </d:response>")
+    body.append("</d:multistatus>")
+    return "\n".join(body).encode()
+
+
+def test_supports_uri_under_base_url():
+    src = WebDAVSource(source_id="nc", base_url="https://nc.example.com/dav/")
+    assert src.supports("https://nc.example.com/dav/file.md")
+    assert src.supports("https://nc.example.com/dav/sub/file.md")
+    assert not src.supports("https://nc.example.com/other/file.md")
+    assert not src.supports("https://other.example.com/dav/file.md")
+
+
+def test_base_url_trailing_slash_normalised():
+    """base_url without trailing slash mustn't break urljoin during discovery."""
+    src = WebDAVSource(source_id="nc", base_url="https://nc.example.com/dav")
+    assert src.base_url == "https://nc.example.com/dav/"
+    assert src.supports("https://nc.example.com/dav/x.md")
+
+
+@pytest.mark.asyncio
+async def test_fetch_returns_bytes_md5_revision_and_content_type():
+    body = b"hello dav"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            content=body,
+            headers={
+                "content-type": "text/markdown; charset=utf-8",
+                "etag": '"rev-1"',
+                "last-modified": "Wed, 21 Oct 2025 07:28:00 GMT",
+            },
+        )
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    result = await src.fetch("https://nc.example.com/dav/a.md")
+    assert result.body == body
+    assert result.content_hash == hashlib.md5(body, usedforsecurity=False).hexdigest()
+    assert result.content_type == "text/markdown"
+    assert result.revision == "rev-1"
+    assert result.extra_metadata == {"last_modified": "Wed, 21 Oct 2025 07:28:00 GMT"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_falls_back_to_last_modified_when_no_etag():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"x",
+            headers={
+                "content-type": "text/plain",
+                "last-modified": "Wed, 21 Oct 2025 07:28:00 GMT",
+            },
+        )
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    result = await src.fetch("https://nc.example.com/dav/a.txt")
+    assert result.revision == "Wed, 21 Oct 2025 07:28:00 GMT"
+
+
+@pytest.mark.asyncio
+async def test_head_returns_etag_from_propfind_depth_zero():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PROPFIND"
+        assert request.headers["Depth"] == "0"
+        return httpx.Response(
+            207,
+            content=_multistatus(
+                {"href": "/dav/a.md", "etag": '"rev-9"'},
+            ),
+        )
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    assert await src.head("https://nc.example.com/dav/a.md") == "rev-9"
+
+
+@pytest.mark.asyncio
+async def test_head_returns_none_on_404():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    assert await src.head("https://nc.example.com/dav/missing.md") is None
+
+
+@pytest.mark.asyncio
+async def test_discover_yields_upserts_and_skips_collections_and_unsupported():
+    multistatus = _multistatus(
+        {"href": "/dav/", "collection": True},
+        {"href": "/dav/sub/", "collection": True},
+        {"href": "/dav/a.md", "etag": '"rev-a"', "content_type": "text/markdown"},
+        {"href": "/dav/sub/b.txt", "etag": '"rev-b"', "content_type": "text/plain"},
+        {"href": "/dav/skip.log", "etag": '"rev-log"', "content_type": "text/plain"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PROPFIND"
+        assert request.headers["Depth"] == "infinity"
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+
+    events = [event async for event in src.discover()]
+    by_uri = {e.uri: e for e in events}
+    assert set(by_uri) == {
+        "https://nc.example.com/dav/a.md",
+        "https://nc.example.com/dav/sub/b.txt",
+    }
+    assert all(e.kind is SourceEventKind.UPSERT for e in events)
+    assert by_uri["https://nc.example.com/dav/a.md"].revision == "rev-a"
+
+
+@pytest.mark.asyncio
+async def test_discover_emits_unchanged_when_snapshot_matches():
+    multistatus = _multistatus(
+        {"href": "/dav/", "collection": True},
+        {"href": "/dav/a.md", "etag": '"rev-a"', "content_type": "text/markdown"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    snapshot = {"https://nc.example.com/dav/a.md": "rev-a"}
+    events = [event async for event in src.discover(since=snapshot)]
+    assert [e.kind for e in events] == [SourceEventKind.UNCHANGED]
+
+
+@pytest.mark.asyncio
+async def test_discover_emits_delete_for_files_no_longer_listed():
+    multistatus = _multistatus(
+        {"href": "/dav/", "collection": True},
+        {"href": "/dav/a.md", "etag": '"rev-a"', "content_type": "text/markdown"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    revisions = {"https://nc.example.com/dav/a.md": "rev-a"}
+    known = {
+        "https://nc.example.com/dav/a.md",
+        "https://nc.example.com/dav/gone.md",
+    }
+    events = [event async for event in src.discover(since=revisions, known_uris=known)]
+    kinds = {e.uri: e.kind for e in events}
+    assert kinds == {
+        "https://nc.example.com/dav/a.md": SourceEventKind.UNCHANGED,
+        "https://nc.example.com/dav/gone.md": SourceEventKind.DELETE,
+    }
+
+
+@pytest.mark.asyncio
+async def test_discover_uses_last_modified_when_etag_absent():
+    multistatus = _multistatus(
+        {
+            "href": "/dav/a.md",
+            "last_modified": "Wed, 21 Oct 2025 07:28:00 GMT",
+            "content_type": "text/markdown",
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    events = [event async for event in src.discover()]
+    assert events[0].revision == "Wed, 21 Oct 2025 07:28:00 GMT"
+
+
+@pytest.mark.asyncio
+async def test_discover_raises_on_malformed_xml():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=b"<not></valid xml")
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    with pytest.raises(ValueError, match="Invalid PROPFIND"):
+        [event async for event in src.discover()]
+
+
+@pytest.mark.asyncio
+async def test_discover_propagates_http_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        [event async for event in src.discover()]
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_sent_when_credentials_configured():
+    seen_auth: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers.get("authorization"))
+        return httpx.Response(
+            207,
+            content=_multistatus({"href": "/dav/", "collection": True}),
+        )
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        username="alice",
+        password="hunter2",
+        transport=_transport(handler),
+    )
+    [event async for event in src.discover()]
+    assert seen_auth and seen_auth[0] is not None
+    assert seen_auth[0].startswith("Basic ")
+
+
+@pytest.mark.asyncio
+async def test_custom_headers_forwarded():
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(
+            207,
+            content=_multistatus({"href": "/dav/", "collection": True}),
+        )
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        headers={"Authorization": "Bearer tok-123"},
+        transport=_transport(handler),
+    )
+    [event async for event in src.discover()]
+    assert seen == ["Bearer tok-123"]
+
+
+@pytest.mark.asyncio
+async def test_discover_resolves_absolute_href():
+    """Some servers return absolute URLs in href, others return server paths.
+    Both must produce the same stored URI."""
+    multistatus = _multistatus(
+        {
+            "href": "https://nc.example.com/dav/a.md",
+            "etag": '"rev"',
+            "content_type": "text/markdown",
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    events = [event async for event in src.discover()]
+    assert [e.uri for e in events] == ["https://nc.example.com/dav/a.md"]
+
+
+@pytest.mark.asyncio
+async def test_discover_url_decodes_href_path():
+    """PROPFIND hrefs are percent-encoded per RFC 3986. We unquote them so
+    the stored URI matches what a user types in `add-src`."""
+    multistatus = _multistatus(
+        {
+            "href": "/dav/my%20docs/Hello%20World.md",
+            "etag": '"rev"',
+            "content_type": "text/markdown",
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    events = [event async for event in src.discover()]
+    assert [e.uri for e in events] == [
+        "https://nc.example.com/dav/my docs/Hello World.md"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discover_emits_unchanged_for_known_uri_without_revision():
+    """A WebDAV entry with no ETag or Last-Modified should not cause
+    re-ingestion every sweep once the URI has been ingested."""
+    multistatus = _multistatus(
+        {"href": "/dav/", "collection": True},
+        {"href": "/dav/norev.md", "content_type": "text/markdown"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    events = [
+        e
+        async for e in src.discover(known_uris={"https://nc.example.com/dav/norev.md"})
+    ]
+    non_delete = [e for e in events if e.kind is not SourceEventKind.DELETE]
+    assert len(non_delete) == 1
+    assert non_delete[0].kind is SourceEventKind.UNCHANGED
+
+
+@pytest.mark.asyncio
+async def test_discover_emits_upsert_for_unknown_uri_without_revision():
+    """A brand-new WebDAV entry with no revision should UPSERT on first sight."""
+    multistatus = _multistatus(
+        {"href": "/dav/", "collection": True},
+        {"href": "/dav/new.md", "content_type": "text/markdown"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    events = [e async for e in src.discover()]
+    non_delete = [e for e in events if e.kind is not SourceEventKind.DELETE]
+    assert len(non_delete) == 1
+    assert non_delete[0].kind is SourceEventKind.UPSERT
+
+
+@pytest.mark.asyncio
+async def test_fetch_follows_redirect():
+    """Plone commonly 301s (trailing-slash normalisation, VHM rewrites); the
+    client must follow to fetch the real bytes instead of returning the 3xx."""
+    body = b"redirected body"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/dav/a.md":
+            return httpx.Response(
+                301, headers={"location": "https://nc.example.com/dav/final.md"}
+            )
+        assert request.url.path == "/dav/final.md"
+        return httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "text/markdown", "etag": '"rev-1"'},
+        )
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    result = await src.fetch("https://nc.example.com/dav/a.md")
+    assert result.body == body
+    assert result.revision == "rev-1"
+
+
+@pytest.mark.asyncio
+async def test_discover_follows_redirect_preserving_propfind():
+    """A 302 on PROPFIND is followed with the method preserved (httpx would
+    downgrade it to GET). A same-path scheme upgrade is transparent, and hrefs
+    stay anchored to base_url so stored URIs remain stable for the worker."""
+    methods: list[str] = []
+    multistatus = _multistatus(
+        {"href": "/dav/a.md", "etag": '"rev-a"', "content_type": "text/markdown"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.url.scheme == "http":
+            return httpx.Response(
+                302, headers={"location": "https://nc.example.com/dav/"}
+            )
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="http://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    events = [event async for event in src.discover()]
+    assert methods == ["PROPFIND", "PROPFIND"]
+    assert [e.uri for e in events] == ["http://nc.example.com/dav/a.md"]
+
+
+@pytest.mark.asyncio
+async def test_discover_raises_when_collection_relocates():
+    """If the collection root redirects to a different path, the multistatus
+    hrefs fall outside base_url. Resolving them against base_url would skip
+    every file and DELETE all known docs — fail loudly instead."""
+    multistatus = _multistatus(
+        {"href": "/dav2/a.md", "etag": '"rev-a"', "content_type": "text/markdown"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/dav/":
+            return httpx.Response(
+                301, headers={"location": "https://nc.example.com/dav2/"}
+            )
+        return httpx.Response(207, content=multistatus)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    with pytest.raises(ValueError, match="redirected to a different path"):
+        [event async for event in src.discover()]
+
+
+@pytest.mark.asyncio
+async def test_discover_refuses_cross_host_redirect_without_sending_credentials():
+    """A PROPFIND redirected to another host must not have the configured
+    credentials replayed to that host (httpx only strips auth cross-host for
+    its own auto-followed redirects, not our manual loop)."""
+    seen_hosts: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        return httpx.Response(
+            302, headers={"location": "https://evil.example.com/dav/"}
+        )
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        username="alice",
+        password="hunter2",
+        transport=_transport(handler),
+    )
+    with pytest.raises(ValueError, match="different host"):
+        [event async for event in src.discover()]
+    assert "evil.example.com" not in seen_hosts
+
+
+@pytest.mark.asyncio
+async def test_head_follows_redirect_preserving_propfind():
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.url.path == "/dav/a.md":
+            return httpx.Response(
+                302, headers={"location": "https://nc.example.com/dav/final.md"}
+            )
+        return httpx.Response(207, content=_multistatus({"href": "/x", "etag": '"r"'}))
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    assert await src.head("https://nc.example.com/dav/a.md") == "r"
+    assert methods == ["PROPFIND", "PROPFIND"]
+
+
+@pytest.mark.asyncio
+async def test_propfind_redirect_loop_is_bounded():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://nc.example.com/loop/"})
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    with pytest.raises(httpx.TooManyRedirects):
+        [event async for event in src.discover()]
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_file_exceeding_max_size():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"content-length": "5000"})
+        return httpx.Response(200, content=b"big")
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+        max_file_size=1000,
+    )
+    with pytest.raises(FileTooLargeError):
+        await src.fetch("https://nc.example.com/dav/big.bin")
+
+
+@pytest.mark.asyncio
+async def test_fetch_allows_file_within_max_size():
+    body = b"small"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"content-length": str(len(body))})
+        return httpx.Response(200, content=body, headers={"content-type": "text/plain"})
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+        max_file_size=1000,
+    )
+    result = await src.fetch("https://nc.example.com/dav/a.txt")
+    assert result.body == body
+
+
+@pytest.mark.asyncio
+async def test_fetch_skips_head_when_no_max_size():
+    """When max_file_size is None, no HEAD request is made."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(200, content=b"ok")
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+        max_file_size=None,
+    )
+    await src.fetch("https://nc.example.com/dav/a.txt")
+    assert calls == ["GET"]
+
+
+# Malformed multistatus bodies: a <response> that can't be decoded is dropped
+# rather than aborting the whole listing.
+
+
+def _raw_multistatus(*response_blocks: str) -> bytes:
+    body = ['<?xml version="1.0" encoding="utf-8"?>', '<d:multistatus xmlns:d="DAV:">']
+    body.extend(response_blocks)
+    body.append("</d:multistatus>")
+    return "\n".join(body).encode()
+
+
+_NO_HREF = """  <d:response>
+    <d:propstat>
+      <d:status>HTTP/1.1 200 OK</d:status>
+      <d:prop><d:getetag>"r"</d:getetag></d:prop>
+    </d:propstat>
+  </d:response>"""
+
+_EMPTY_HREF = """  <d:response>
+    <d:href></d:href>
+    <d:propstat>
+      <d:status>HTTP/1.1 200 OK</d:status>
+      <d:prop><d:getetag>"r"</d:getetag></d:prop>
+    </d:propstat>
+  </d:response>"""
+
+_NO_STATUS = """  <d:response>
+    <d:href>/dav/a.md</d:href>
+    <d:propstat>
+      <d:prop><d:getetag>"r"</d:getetag></d:prop>
+    </d:propstat>
+  </d:response>"""
+
+_NOT_FOUND_STATUS = """  <d:response>
+    <d:href>/dav/a.md</d:href>
+    <d:propstat>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+      <d:prop><d:getetag>"r"</d:getetag></d:prop>
+    </d:propstat>
+  </d:response>"""
+
+_STATUS_WITHOUT_PROP = """  <d:response>
+    <d:href>/dav/a.md</d:href>
+    <d:propstat>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "block",
+    [_NO_HREF, _EMPTY_HREF, _NO_STATUS, _NOT_FOUND_STATUS],
+    ids=["no_href", "empty_href", "propstat_without_status", "propstat_404"],
+)
+async def test_head_returns_none_for_undecodable_response(block):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=_raw_multistatus(block))
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    assert await src.head("https://nc.example.com/dav/a.md") is None
+
+
+@pytest.mark.asyncio
+async def test_head_returns_none_for_empty_multistatus():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=_raw_multistatus())
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    assert await src.head("https://nc.example.com/dav/a.md") is None
+
+
+def test_entry_with_status_but_no_prop_has_no_revision():
+    """A 200 propstat carrying no <prop> still yields an entry, without a
+    revision — distinct from the malformed bodies that yield no entry at all."""
+    from haiku.rag.sources.webdav import _parse_multistatus
+
+    entries = _parse_multistatus(_raw_multistatus(_STATUS_WITHOUT_PROP))
+
+    assert len(entries) == 1
+    assert entries[0].revision is None
+    assert _parse_multistatus(_raw_multistatus(_NO_HREF)) == []
+
+
+@pytest.mark.asyncio
+async def test_discover_skips_base_url_reported_as_file():
+    """Broken servers list the base URL itself as a non-collection; it and any
+    href outside the base are skipped."""
+    body = _multistatus(
+        {"href": "/dav/", "etag": '"base"'},
+        {"href": "/outside/x.md", "etag": '"out"'},
+        {"href": "/dav/keep.md", "etag": '"keep"'},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(207, content=body)
+
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(handler),
+    )
+    events = [event async for event in src.discover()]
+    assert {e.uri for e in events} == {"https://nc.example.com/dav/keep.md"}
+
+
+@pytest.mark.asyncio
+async def test_aclose_closes_the_http_client():
+    src = WebDAVSource(
+        source_id="nc",
+        base_url="https://nc.example.com/dav/",
+        transport=_transport(lambda r: httpx.Response(200)),
+    )
+    await src.aclose()
+    assert src._http.is_closed

@@ -1,0 +1,200 @@
+import asyncio
+import re
+from io import BytesIO
+from typing import TYPE_CHECKING
+
+from haiku.rag.chunkers.base import DocumentChunker
+from haiku.rag.config import AppConfig, get_config
+from haiku.rag.providers.docling_serve import DoclingServeClient
+from haiku.rag.store.models.chunk import Chunk, ChunkMetadata
+
+if TYPE_CHECKING:
+    from docling_core.types.doc.document import DoclingDocument
+
+# Pattern to parse refs like "#/texts/5" or "#/tables/0"
+REF_PATTERN = re.compile(r"^#/(\w+)/(\d+)$")
+
+
+def _resolve_label_from_document(ref: str, document: "DoclingDocument") -> str | None:
+    """Resolve the label for a doc_item ref by looking it up in the document.
+
+    The docling-serve API only returns ref strings in doc_items, not labels.
+    This function resolves actual labels from the DoclingDocument.
+    See: https://github.com/docling-project/docling-serve/issues/448
+
+    Args:
+        ref: JSON pointer reference like "#/texts/5" or "#/tables/0"
+        document: The DoclingDocument to look up the item in
+
+    Returns:
+        The label string if found, None otherwise
+    """
+    match = REF_PATTERN.match(ref)
+    if not match:
+        return None
+
+    collection_name = match.group(1)
+    index = int(match.group(2))
+
+    collection = getattr(document, collection_name, None)
+    if collection is None or index >= len(collection):
+        return None
+
+    item = collection[index]
+    return getattr(item, "label", None)
+
+
+class DoclingServeChunker(DocumentChunker):
+    """Remote document chunker using docling-serve API.
+
+    Sends DoclingDocument JSON to docling-serve for chunking. Supports both hybrid
+    and hierarchical chunking strategies via remote API.
+
+    Args:
+        config: Application configuration containing docling-serve settings.
+    """
+
+    def __init__(self, config: AppConfig | None = None):
+        self.config = config if config is not None else get_config()
+        self.client = DoclingServeClient.from_config(
+            self.config.providers.docling_serve
+        )
+        self.chunker_type = self.config.processing.chunker_type
+
+    def _build_chunking_data(self) -> dict[str, str | list[str]]:
+        """Build form data for chunking request."""
+        opts = self.config.processing.conversion_options
+        data: dict[str, str | list[str]] = {
+            "convert_do_ocr": str(opts.do_ocr).lower(),
+            "convert_force_ocr": str(opts.force_ocr).lower(),
+            "convert_ocr_engine": opts.ocr_engine,
+            "chunking_max_tokens": str(self.config.processing.chunk_size),
+            "chunking_tokenizer": self.config.processing.chunking_tokenizer,
+            "chunking_merge_peers": str(
+                self.config.processing.chunking_merge_peers
+            ).lower(),
+            "chunking_use_markdown_tables": str(
+                self.config.processing.chunking_use_markdown_tables
+            ).lower(),
+            "chunking_include_raw_text": "true",
+        }
+        if opts.ocr_lang:
+            data["convert_ocr_lang"] = opts.ocr_lang
+        return data
+
+    async def _call_chunk_api(self, document: "DoclingDocument") -> list[dict]:
+        """Call docling-serve chunking API and return raw chunk data.
+
+        Args:
+            document: The DoclingDocument to be split into chunks.
+
+        Returns:
+            List of chunk dictionaries from API response.
+
+        Raises:
+            ValueError: If chunking fails or service is unavailable.
+        """
+        # Determine endpoint based on chunker_type
+        if self.chunker_type == "hierarchical":
+            endpoint = "/v1/chunk/hierarchical/file/async"
+        else:
+            endpoint = "/v1/chunk/hybrid/file/async"
+
+        # Export document to JSON off the event loop. model_dump_json over a
+        # document carrying inlined base64 page/picture images is CPU-heavy and
+        # proportional to document size; running it inline would block every
+        # other worker's coroutine for the duration of the serialization.
+        doc_bytes = await asyncio.to_thread(
+            lambda: document.model_dump_json().encode("utf-8")
+        )
+
+        # Prepare multipart request with DoclingDocument JSON
+        files = {"files": ("document.json", BytesIO(doc_bytes), "application/json")}
+        data = self._build_chunking_data()
+
+        result = await self.client.submit_and_poll(
+            endpoint=endpoint,
+            files=files,
+            data=data,
+            name="document",
+        )
+
+        # Task-level polling status can be "success" while individual documents
+        # report "failure" (e.g. schema version mismatch), returning 0 chunks silently.
+        documents = result.get("documents", [])
+        for doc_result in documents:
+            if doc_result.get("status") not in ("success", "partial_success", None):
+                errors = doc_result.get("errors", [])
+                raise ValueError(f"Chunking failed: {errors}")
+
+        return result.get("chunks", [])
+
+    async def chunk(self, document: "DoclingDocument | None") -> list[Chunk]:
+        """Split the document into chunks with metadata via docling-serve.
+
+        Extracts structured metadata from the API response including:
+        - doc_item_refs: JSON pointer references to DocItems (e.g., "#/texts/5")
+        - headings: Section heading hierarchy
+        - labels: Semantic labels for each doc_item
+        - page_numbers: Page numbers where content appears
+
+        Args:
+            document: The DoclingDocument to be split into chunks.
+
+        Returns:
+            List of Chunk containing content and structured metadata.
+
+        Raises:
+            ValueError: If chunking fails or service is unavailable.
+        """
+        if document is None:
+            return []
+
+        raw_chunks = await self._call_chunk_api(document)
+        result: list[Chunk] = []
+
+        for chunk in raw_chunks:
+            # ``text`` is the embedding-targeted serialization (headings and
+            # captions prepended); ``raw_text`` is the bare body. Store the
+            # body and let the embedding/FTS layer contextualize from headings.
+            text = chunk.get("raw_text") or chunk.get("text", "")
+
+            # doc_items from docling-serve is a list of ref strings like ["#/texts/1", "#/tables/0"]
+            doc_items = chunk.get("doc_items", [])
+            doc_item_refs: list[str] = []
+            labels: list[str] = []
+
+            for item in doc_items:
+                if isinstance(item, str):
+                    # docling-serve returns refs as strings directly
+                    doc_item_refs.append(item)
+                    # Resolve label from the document using the ref
+                    label = _resolve_label_from_document(item, document)
+                    if label:
+                        labels.append(label)
+                elif isinstance(item, dict):
+                    # Handle dict format if API ever returns it
+                    if "self_ref" in item:
+                        doc_item_refs.append(item["self_ref"])
+                    if "label" in item:
+                        labels.append(item["label"])
+
+            headings = chunk.get("headings")
+
+            page_numbers = chunk.get("page_numbers", [])
+
+            chunk_metadata = ChunkMetadata(
+                doc_item_refs=doc_item_refs,
+                headings=headings,
+                labels=labels,
+                page_numbers=sorted(page_numbers) if page_numbers else [],
+            )
+            result.append(
+                Chunk(
+                    content=text,
+                    metadata=chunk_metadata.model_dump(),
+                    order=len(result),
+                )
+            )
+
+        return result

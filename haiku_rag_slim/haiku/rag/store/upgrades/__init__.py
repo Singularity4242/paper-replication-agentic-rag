@@ -1,0 +1,116 @@
+import logging
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from packaging.version import Version, parse
+
+if TYPE_CHECKING:
+    from haiku.rag.store.engine import Store
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Upgrade:
+    """Represents a database upgrade step."""
+
+    version: str
+    apply: Callable[["Store"], Coroutine[Any, Any, None]]
+    description: str = ""
+
+
+# Registry of upgrade steps (ordered by version)
+upgrades: list[Upgrade] = []
+
+
+def get_pending_upgrades(from_version: str) -> list[Upgrade]:
+    """Get pending upgrades from the given version.
+
+    Returns:
+        List of Upgrade objects where from_version < upgrade.version,
+        sorted by version in ascending order.
+    """
+    v_from: Version = parse(from_version)
+    sorted_steps = sorted(upgrades, key=lambda u: parse(u.version))
+    return [s for s in sorted_steps if v_from < parse(s.version)]
+
+
+async def run_pending_upgrades(store: "Store", from_version: str) -> list[str]:
+    """Run upgrades where from_version < step.version.
+
+    Returns:
+        List of descriptions of applied upgrades.
+    """
+    applicable = get_pending_upgrades(from_version)
+
+    if applicable:
+        logger.info("%d upgrade step(s) pending", len(applicable))
+
+    applied: list[str] = []
+
+    # Apply in ascending order
+    for idx, step in enumerate(applicable, start=1):
+        logger.info(
+            "Applying upgrade %s: %s (%d/%d)",
+            step.version,
+            step.description or "",
+            idx,
+            len(applicable),
+        )
+        await step.apply(store)
+        logger.info("Completed upgrade %s", step.version)
+        applied.append(
+            f"{step.version}: {step.description}" if step.description else step.version
+        )
+
+    return applied
+
+
+# Import upgrade modules AFTER Upgrade class is defined to avoid circular imports
+# ruff: noqa: E402, I001
+from haiku.rag.store.upgrades.v0_20_0 import (
+    upgrade_add_docling_document as upgrade_0_20_0_docling,
+)
+from haiku.rag.store.upgrades.v0_23_1 import (
+    upgrade_contextualize_chunks as upgrade_0_23_1_contextualize,
+)
+from haiku.rag.store.upgrades.v0_25_0 import (
+    upgrade_compress_docling_document as upgrade_0_25_0_compress,
+)
+from haiku.rag.store.upgrades.v0_38_0 import (
+    upgrade_split_pages_zstd as upgrade_0_38_0_split_pages,
+)
+from haiku.rag.store.upgrades.v0_40_0 import (
+    upgrade_populate_document_items as upgrade_0_40_0_document_items,
+)
+from haiku.rag.store.upgrades.v0_45_0 import (
+    upgrade_extract_picture_bytes as upgrade_0_45_0_extract_picture_bytes,
+)
+from haiku.rag.store.upgrades.v0_48_0 import (
+    upgrade_backfill_heading_hierarchy as upgrade_0_48_0_heading_hierarchy,
+)
+from haiku.rag.store.upgrades.v0_50_0 import (
+    upgrade_canonical_metadata_keys as upgrade_0_50_0_canonical_metadata_keys,
+)
+from haiku.rag.store.upgrades.v0_58_0 import (
+    upgrade_split_document_meta as upgrade_0_58_0_split_document_meta,
+)
+from haiku.rag.store.upgrades.v0_64_0 import (
+    upgrade_rename_document_meta_id as upgrade_0_64_0_rename_document_meta_id,
+)
+from haiku.rag.store.upgrades.v0_75_0 import (
+    upgrade_index_hot_lookup_keys as upgrade_0_75_0_index_hot_lookup_keys,
+)
+
+upgrades.append(upgrade_0_20_0_docling)
+upgrades.append(upgrade_0_23_1_contextualize)
+upgrades.append(upgrade_0_25_0_compress)
+upgrades.append(upgrade_0_38_0_split_pages)
+upgrades.append(upgrade_0_40_0_document_items)
+upgrades.append(upgrade_0_45_0_extract_picture_bytes)
+upgrades.append(upgrade_0_48_0_heading_hierarchy)
+upgrades.append(upgrade_0_50_0_canonical_metadata_keys)
+upgrades.append(upgrade_0_58_0_split_document_meta)
+upgrades.append(upgrade_0_64_0_rename_document_meta_id)
+upgrades.append(upgrade_0_75_0_index_hot_lookup_keys)

@@ -1,0 +1,52 @@
+from unittest.mock import MagicMock
+
+from evaluations.evaluators.citation import CitationMAPEvaluator
+
+
+def _ctx(cited: list[str], relevant: list[str]) -> MagicMock:
+    ctx = MagicMock()
+    ctx.metadata = {"relevant_uris": relevant}
+    ctx.attributes = {"cited_uris": cited}
+    return ctx
+
+
+class TestCitationMAPEvaluator:
+    def setup_method(self) -> None:
+        self.evaluator = CitationMAPEvaluator()
+
+    def test_all_relevant_first(self) -> None:
+        # Both relevant docs cited at ranks 1 and 2: AP = (1/1 + 2/2) / 2 = 1.0
+        assert self.evaluator.evaluate(_ctx(["a", "b"], ["a", "b"])) == 1.0
+
+    def test_partial_match(self) -> None:
+        # Cited a, x, b. relevant a, b. P@1 = 1/1, P@3 = 2/3. AP = (1 + 2/3)/2
+        assert (
+            self.evaluator.evaluate(_ctx(["a", "x", "b"], ["a", "b"]))
+            == (1.0 + 2 / 3) / 2
+        )
+
+    def test_no_matches(self) -> None:
+        assert self.evaluator.evaluate(_ctx(["x", "y"], ["a", "b"])) == 0.0
+
+    def test_no_citations(self) -> None:
+        assert self.evaluator.evaluate(_ctx([], ["a"])) == 0.0
+
+    def test_ineligible_when_no_relevant_uris(self) -> None:
+        """Turns without gold passages (unanswerable) produce no score at all,
+        not a penalizing zero."""
+        assert self.evaluator.evaluate(_ctx(["a"], [])) == {}
+
+    def test_ineligible_when_relevant_uris_missing(self) -> None:
+        ctx = MagicMock()
+        ctx.metadata = {"answerability": "UNANSWERABLE"}
+        ctx.attributes = {"cited_uris": ["a"]}
+        assert self.evaluator.evaluate(ctx) == {}
+
+    def test_ineligible_when_metadata_none(self) -> None:
+        ctx = MagicMock()
+        ctx.metadata = None
+        ctx.attributes = {"cited_uris": ["a"]}
+        assert self.evaluator.evaluate(ctx) == {}
+
+    def test_evaluation_name(self) -> None:
+        assert self.evaluator.get_default_evaluation_name() == "cited_map"

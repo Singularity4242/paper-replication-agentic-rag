@@ -1,0 +1,99 @@
+from haiku.rag.config.loader import (
+    MissingEnvVarError,
+    expand_env_vars,
+    find_config_file,
+    generate_default_config,
+    load_yaml_config,
+    redact_secrets,
+)
+from haiku.rag.config.models import (
+    APIConfig,
+    AppConfig,
+    CircuitBreakerConfig,
+    ConversionOptions,
+    DoclingServeConfig,
+    EmbeddingModelConfig,
+    EmbeddingsConfig,
+    FSSourceConfig,
+    HTTPSourceConfig,
+    IngesterConfig,
+    LanceDBConfig,
+    ModelConfig,
+    OllamaConfig,
+    PluginSourceConfig,
+    ProcessingConfig,
+    PromptsConfig,
+    ProvidersConfig,
+    QAConfig,
+    QueueConfig,
+    RerankingConfig,
+    RetryPolicyConfig,
+    S3SourceConfig,
+    SourceConfig,
+    StorageConfig,
+    WebDAVSourceConfig,
+    WorkerConfig,
+)
+
+__all__ = [
+    "APIConfig",
+    "AppConfig",
+    "CircuitBreakerConfig",
+    "ConversionOptions",
+    "DoclingServeConfig",
+    "EmbeddingModelConfig",
+    "EmbeddingsConfig",
+    "FSSourceConfig",
+    "HTTPSourceConfig",
+    "IngesterConfig",
+    "LanceDBConfig",
+    "ModelConfig",
+    "OllamaConfig",
+    "PluginSourceConfig",
+    "ProcessingConfig",
+    "PromptsConfig",
+    "ProvidersConfig",
+    "QAConfig",
+    "QueueConfig",
+    "RerankingConfig",
+    "RetryPolicyConfig",
+    "S3SourceConfig",
+    "SourceConfig",
+    "StorageConfig",
+    "WebDAVSourceConfig",
+    "WorkerConfig",
+    "MissingEnvVarError",
+    "expand_env_vars",
+    "find_config_file",
+    "generate_default_config",
+    "get_config",
+    "load_yaml_config",
+    "redact_secrets",
+    "set_config",
+]
+
+# Global config instance - initially loads from default locations
+_config: AppConfig | None = None
+
+
+def _load_default_config() -> AppConfig:
+    """Load config from the default locations."""
+    config_path = find_config_file(None)
+    if config_path:
+        yaml_data = load_yaml_config(config_path)
+        return AppConfig.model_validate(yaml_data)
+    return AppConfig()
+
+
+def set_config(config: AppConfig) -> None:
+    """Set the global config instance (used by CLI to override)."""
+    global _config
+    _config = config
+
+
+def get_config() -> AppConfig:
+    """Get the current config instance, loading it on first use."""
+    global _config
+    if _config is None:
+        _config = _load_default_config()
+    return _config

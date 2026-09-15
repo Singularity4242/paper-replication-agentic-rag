@@ -1,0 +1,47 @@
+# haiku.rag configuration for the chat app
+# Copy to haiku.rag.yaml and customize as needed
+
+# The database. The compose files mount DB_VOLUME (default
+# ./data/haiku.rag.lancedb) at /data.
+lancedb:
+  databases:
+    haiku.rag: /data
+
+# QA model configuration
+qa:
+  model:
+    provider: ollama
+    name: gpt-oss
+    # For Anthropic:
+    # provider: anthropic
+    # name: claude-sonnet-4-20250514
+    # For OpenAI:
+    # provider: openai
+    # name: gpt-4o
+
+# Embedding configuration
+embeddings:
+  model:
+    provider: ollama
+    name: qwen3-embedding:4b
+    vector_dim: 2560
+    # For OpenAI:
+    # provider: openai
+    # name: text-embedding-3-small
+    # vector_dim: 1536
+
+# Optional reranking
+# reranking:
+#   model:
+#     provider: cohere
+#     name: rerank-v3.5
+
+# Search settings
+search:
+  limit: 5
+
+# Provider settings
+providers:
+  ollama:
+    # Use host.docker.internal to reach Ollama running on the host machine
+    base_url: http://host.docker.internal:11434

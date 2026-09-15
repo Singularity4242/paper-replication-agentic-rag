@@ -1,0 +1,299 @@
+from typing import TYPE_CHECKING, Literal
+
+from pydantic import BaseModel, PrivateAttr
+
+if TYPE_CHECKING:
+    from docling_core.types.doc.document import DocItem, DoclingDocument
+
+
+class BoundingBox(BaseModel):
+    """Bounding box coordinates for visual grounding."""
+
+    page_no: int
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+
+class ChunkMetadata(BaseModel):
+    """
+    Structured metadata for a chunk, including DoclingDocument references.
+
+    Attributes:
+        doc_item_refs: JSON pointer references to DocItems in the parent DoclingDocument
+                       (e.g., ["#/texts/5", "#/texts/6", "#/tables/0"])
+        headings: Section heading hierarchy for this chunk
+                  (e.g., ["Chapter 1", "Section 1.1"])
+        labels: Semantic labels for each doc_item (e.g., ["paragraph", "table"])
+        page_numbers: Page numbers where the chunk content appears
+    """
+
+    doc_item_refs: list[str] = []
+    headings: list[str] | None = None
+    labels: list[str] = []
+    page_numbers: list[int] = []
+
+    def resolve_doc_items(self, docling_document: "DoclingDocument") -> list["DocItem"]:
+        """Resolve doc_item_refs to actual DocItem objects.
+
+        Args:
+            docling_document: The parent DoclingDocument containing the items.
+
+        Returns:
+            List of resolved DocItem objects. Items that fail to resolve are skipped.
+        """
+        from docling_core.types.doc.document import RefItem
+
+        doc_items = []
+        for ref in self.doc_item_refs:
+            try:
+                ref_item = RefItem.model_validate({"$ref": ref})
+                doc_item = ref_item.resolve(docling_document)
+                doc_items.append(doc_item)
+            except Exception:
+                # Graceful degradation: skip refs that can't be resolved
+                continue
+        return doc_items
+
+    def resolve_bounding_boxes(
+        self, docling_document: "DoclingDocument"
+    ) -> list[BoundingBox]:
+        """Resolve doc_item_refs to bounding boxes for visual grounding.
+
+        Args:
+            docling_document: The parent DoclingDocument containing the items.
+
+        Returns:
+            List of BoundingBox objects from resolved DocItems' provenance.
+        """
+        bounding_boxes = []
+        for doc_item in self.resolve_doc_items(docling_document):
+            prov = getattr(doc_item, "prov", None)
+            if not prov:
+                continue
+            for prov_item in prov:
+                bbox = getattr(prov_item, "bbox", None)
+                if bbox is None:  # pragma: no cover - prov always carries a bbox
+                    continue
+                bounding_boxes.append(
+                    BoundingBox(
+                        page_no=prov_item.page_no,
+                        left=bbox.l,
+                        top=bbox.t,
+                        right=bbox.r,
+                        bottom=bbox.b,
+                    )
+                )
+        return bounding_boxes
+
+
+class Chunk(BaseModel):
+    """
+    Represents a chunk with content, metadata, and optional document information.
+    """
+
+    id: str | None = None
+    document_id: str | None = None
+    content: str
+    metadata: dict = {}
+    order: int = 0
+    document_uri: str | None = None
+    document_title: str | None = None
+    document_meta: dict = {}
+    embedding: list[float] | None = None
+
+    # Transient: picture bytes for synthetic picture chunks. Set by
+    # build_picture_chunks; consumed by embed_chunks to route through
+    # embed_images. Excluded from serialization (PrivateAttr).
+    _picture_data: bytes | None = PrivateAttr(default=None)
+
+    def get_chunk_metadata(self) -> ChunkMetadata:
+        """Parse metadata dict into structured ChunkMetadata."""
+        return ChunkMetadata.model_validate(self.metadata)
+
+
+SearchType = Literal["vector", "fts", "hybrid"]
+
+
+def qualified_id(source: str | None, id: str | None) -> tuple[str | None, str | None]:
+    """What tells one chunk from another: an id is unique within a database only.
+
+    For in-memory structures. Serialized ones record the id alone and reject
+    ambiguity instead. Results built by hand carry no id and cannot be told apart.
+    """
+    return (source, id)
+
+
+class SearchResult(BaseModel):
+    """Search result with optional provenance information for citations.
+
+    ``image_data`` carries embedded picture bytes (base64-encoded PNG) keyed by
+    ``self_ref`` for picture-labeled chunks. Empty/None when no pictures or
+    when the caller asked to omit them via ``include_images=False`` on
+    ``client.search``. Same shape is used everywhere — MCP, in-process search,
+    agent toolsets — so non-vision callers see ``None`` and pay nothing.
+
+    ``chunk_ids`` lists the ids of all chunks whose expansion ranges merged
+    into this result; empty means just ``chunk_id``. It lets citation
+    consumers (visual grounding) reproduce a merged expansion and is never
+    part of ``format_for_agent`` output.
+
+    ``document_meta`` carries the parent document's metadata for citation
+    consumers (UIs). Never part of ``format_for_agent`` output.
+
+    ``chunk_meta`` is the anchor chunk's unparsed ``Chunk.metadata`` and does not
+    include the metadata of any other chunks merged with it. Never part of
+    ``format_for_agent`` output.
+
+    ``source`` names the database a result came from: the name from
+    ``lancedb.databases`` or a path's stem, never a path or URI, so a location
+    cannot travel in a result, a citation or a log. Every result a search
+    produces carries it; None only on a result built by hand.
+    """
+
+    content: str
+    score: float
+    source: str | None = None
+    chunk_id: str | None = None
+    chunk_ids: list[str] = []
+    chunk_meta: dict = {}
+    document_id: str | None = None
+    document_uri: str | None = None
+    document_title: str | None = None
+    document_meta: dict = {}
+    order: int = 0
+    doc_item_refs: list[str] = []
+    page_numbers: list[int] = []
+    headings: list[str] | None = None
+    labels: list[str] = []
+    image_data: dict[str, str] | None = None
+    picture_captions: dict[str, str] = {}
+
+    @classmethod
+    def from_chunk(
+        cls,
+        chunk: "Chunk",
+        score: float,
+        image_data: dict[str, str] | None = None,
+    ) -> "SearchResult":
+        """Create from a Chunk."""
+        meta = chunk.get_chunk_metadata()
+        return cls(
+            content=chunk.content,
+            score=score,
+            chunk_id=chunk.id,
+            document_id=chunk.document_id,
+            document_uri=chunk.document_uri,
+            document_title=chunk.document_title,
+            document_meta=chunk.document_meta,
+            order=chunk.order,
+            doc_item_refs=meta.doc_item_refs,
+            page_numbers=meta.page_numbers,
+            headings=meta.headings,
+            labels=meta.labels,
+            chunk_meta=chunk.metadata,
+            image_data=image_data,
+        )
+
+    def format_for_agent(
+        self,
+        rank: int | None = None,
+        total: int | None = None,
+        *,
+        include_collection: bool = False,
+    ) -> str:
+        """Format this search result for inclusion in agent context.
+
+        Args:
+            rank: 1-based position in results (1 = most relevant)
+            total: Total number of results returned
+
+        Produces a structured format with metadata that helps LLMs understand
+        the source and nature of the content. When rank is provided, shows
+        position instead of raw score to avoid confusing LLMs with low RRF scores.
+
+        `include_collection` is the caller's decision, not this result's: a
+        search spanning one collection has nothing to distinguish, whether or
+        not that collection is named.
+        """
+        if rank is not None and total is not None:
+            parts = [f"[{self.chunk_id}] [rank {rank} of {total}]"]
+        elif rank is not None:
+            parts = [f"[{self.chunk_id}] [rank {rank}]"]
+        else:
+            parts = [f"[{self.chunk_id}] (score: {self.score:.2f})"]
+
+        if include_collection and self.source:
+            parts.append(f"Collection: {self.source}")
+
+        # Document source info
+        source_parts = []
+        if self.document_title:
+            source_parts.append(f'"{self.document_title}"')
+        if self.headings:
+            source_parts.append(" > ".join(self.headings))
+        if source_parts:
+            parts.append(f"Source: {' > '.join(source_parts)}")
+
+        # Content type (use primary label if available)
+        if self.labels:
+            primary_label = self._get_primary_label()
+            if primary_label:
+                parts.append(f"Type: {primary_label}")
+
+        # Surface picture captions when present. Order matches the binary
+        # attachments emitted by build_image_content_from_results, so the model
+        # can correlate caption ↔ attached image by position (BinaryContent
+        # identifiers don't survive serialization to the OpenAI vision API).
+        if self.picture_captions:
+            for self_ref, caption in self.picture_captions.items():
+                if caption:
+                    parts.append(f"Figure caption ({self_ref}): {caption}")
+
+        # The actual content
+        parts.append(f"Content:\n{self.content}")
+
+        return "\n".join(parts)
+
+    def _get_primary_label(self) -> str | None:
+        """Get the most significant label for display.
+
+        Prioritizes structural labels over text labels.
+        """
+        if not self.labels:
+            return None
+
+        # Priority order: structural > contextual > text
+        priority = {
+            "table": 1,
+            "code": 2,
+            "form": 3,
+            "field_region": 3,
+            "key_value_region": 4,
+            "field_item": 4,
+            "field_key": 5,
+            "field_value": 6,
+            "field_heading": 7,
+            "list_item": 8,
+            "formula": 9,
+            "chart": 10,
+            "picture": 11,
+            "caption": 12,
+            "footnote": 13,
+            "field_hint": 14,
+            "marker": 15,
+            "section_header": 16,
+            "title": 17,
+        }
+
+        # Find highest priority label
+        best_label = None
+        best_priority = float("inf")
+        for label in self.labels:
+            if label in priority and priority[label] < best_priority:
+                best_label = label
+                best_priority = priority[label]
+
+        # Return best structural/special label, or first label if all are text
+        return best_label if best_label else self.labels[0]

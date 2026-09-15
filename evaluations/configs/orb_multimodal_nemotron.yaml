@@ -1,0 +1,42 @@
+# Reference config for the `orb_multimodal_nemotron` pre-built evaluation database.
+# OpenRAG Bench with the nvidia/llama-nemotron-embed-vl-1b-v2 multimodal embedder,
+# the embedder behind the published headline benchmark numbers.
+# Run: evaluations run orb_multimodal_nemotron --skip-db --config configs/orb_multimodal_nemotron.yaml
+# base_url uses the `vllm` host serving each model over an OpenAI-compatible API.
+
+environment: development
+
+storage:
+  auto_vacuum: false
+
+embeddings:
+  model:
+    provider: vllm
+    name: nvidia/llama-nemotron-embed-vl-1b-v2
+    vector_dim: 2048
+    multimodal: true
+    base_url: http://vllm:11438/v1
+
+reranking:
+  model: null
+
+qa:
+  model:
+    provider: openai
+    name: gemma4-26b
+    base_url: http://vllm:11432/v1
+    vision: true
+
+evaluations:
+  judge:
+    provider: openai
+    name: Inferact/Qwen3.8-27B-NVFP4
+    base_url: http://vllm:11439/v1
+    temperature: 0.6
+    max_tokens: 16384
+    extra_body:
+      top_p: 0.95
+      top_k: 20
+      min_p: 0
+      chat_template_kwargs:
+        reasoning_effort: low

@@ -1,0 +1,495 @@
+from io import BytesIO
+from typing import TYPE_CHECKING, Any
+
+from PIL import Image as PILImage
+from rich.markup import escape
+from textual.containers import Horizontal, VerticalScroll
+from textual.css.query import NoMatches
+from textual.message import Message
+from textual.widgets import Collapsible, LoadingIndicator, Markdown, Static
+from textual.widgets.markdown import MarkdownStream
+from textual_image.widget import Image as TextualImage
+
+from haiku.rag.store.models.chunk import qualified_id
+from haiku.rag.store.models.citation import Citation
+
+if TYPE_CHECKING:
+    from textual.app import ComposeResult
+    from textual.events import Key
+
+
+class ChatMessage(Static):
+    """A single chat message with role styling."""
+
+    def __init__(self, role: str, content: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.role = role
+        self.body_text: str = content
+        self._stream: MarkdownStream | None = None
+
+    def compose(self) -> "ComposeResult":
+        prefix = "You:" if self.role == "user" else "Assistant:"
+        yield Static(prefix, classes="message-prefix")
+        yield Markdown(self.body_text, classes="message-body")
+
+    async def append_delta(self, delta: str) -> None:
+        if not delta:
+            return
+        if self._stream is None:
+            try:
+                body = self.query_one(".message-body", Markdown)
+            except NoMatches:
+                return
+            self._stream = Markdown.get_stream(body)
+        self.body_text += delta
+        await self._stream.write(delta)
+
+    async def finish_stream(self) -> None:
+        if self._stream is None:
+            return
+        await self._stream.stop()
+        self._stream = None
+        try:
+            body = self.query_one(".message-body", Markdown)
+        except NoMatches:
+            return
+        await body.update(self.body_text)
+
+
+class ToolCallWidget(Static):
+    """Displays a single tool call with status indicator."""
+
+    def __init__(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.tool_call_id = tool_call_id
+        self.tool_name = tool_name
+        self.args = args or {}
+        self._completed = False
+
+    def compose(self) -> "ComposeResult":
+        with Horizontal(classes="tool-row"):
+            if self._completed:
+                yield Static("✓", classes="tool-status")
+            else:
+                yield LoadingIndicator(classes="tool-spinner")
+            yield Static(self.tool_name, classes="tool-badge")
+            desc = self._build_description()
+            if desc:
+                yield Static(desc, classes="tool-desc")
+
+    def _build_description(self) -> str:
+        if self.tool_name in {"rag_search", "analysis_search"}:
+            query = self.args.get("query", "...")
+            return f'"{query}"'
+        if self.tool_name == "analysis_execute_code":
+            return str(self.args.get("code", "..."))[:120]
+        if self.args:
+            return str(self.args)
+        return ""
+
+    def update_args(self, args: dict[str, Any]) -> None:
+        self.args = args
+        self.refresh(recompose=True)
+
+    def mark_completed(self) -> None:
+        self._completed = True
+        self.refresh(recompose=True)
+
+
+class CitationWidget(Collapsible):
+    """Inline expandable citation."""
+
+    can_focus = True
+    can_focus_children = False
+
+    class Selected(Message):
+        """Message sent when a citation is selected."""
+
+        def __init__(self, widget: "CitationWidget") -> None:
+            super().__init__()
+            self.widget = widget
+
+    def __init__(
+        self,
+        citation: Citation,
+        picture_bytes: list[bytes] | None = None,
+        include_collection: bool = False,
+        **kwargs,
+    ) -> None:
+        title = f"[{citation.index}] {citation.document_title or citation.document_uri}"
+        if include_collection and citation.source:
+            title += f" — {citation.source}"
+        if citation.page_numbers:
+            pages = ", ".join(map(str, citation.page_numbers[:3]))
+            if len(citation.page_numbers) > 3:
+                pages += "..."
+            title += f" (p.{pages})"
+        # The title is data, not Textual markup.
+        title = escape(title)
+
+        content = citation.content
+        if len(content) > 500:
+            content = content[:500] + "..."
+
+        children: list[Any] = [Markdown(content)]
+        for blob in picture_bytes or []:
+            try:
+                pil = PILImage.open(BytesIO(blob))
+            except Exception:
+                continue
+            children.append(TextualImage(pil, classes="citation-image"))
+        if citation.headings:
+            headings = " > ".join(citation.headings[:3])
+            children.append(
+                Static(escape(f"Section: {headings}"), classes="citation-metadata")
+            )
+        children.append(
+            Static(
+                escape(f"Source: {citation.document_uri}"),
+                classes="citation-metadata",
+            )
+        )
+
+        super().__init__(*children, title=title, collapsed=True, **kwargs)
+        self.citation = citation
+
+    def on_focus(self) -> None:
+        """When focused, mark as selected."""
+        self.post_message(self.Selected(self))
+
+    def on_key(self, event: "Key") -> None:
+        """Handle Enter to toggle expand/collapse."""
+        if event.key == "enter":
+            self.collapsed = not self.collapsed
+            event.stop()
+
+
+class ProgramWidget(Collapsible):
+    """Inline expandable program code block."""
+
+    def __init__(self, program: str, **kwargs) -> None:
+        content = f"```python\n{program}\n```"
+        super().__init__(
+            Markdown(content),
+            title="Program",
+            collapsed=True,
+            **kwargs,
+        )
+
+    def on_key(self, event: "Key") -> None:
+        """Handle Enter to toggle expand/collapse."""
+        if event.key == "enter":
+            self.collapsed = not self.collapsed
+            event.stop()
+
+
+class ThinkingWidget(Static):
+    """Thinking indicator shown while agent is processing."""
+
+    def __init__(self, text: str = "Thinking...", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._text = text
+
+    def compose(self) -> "ComposeResult":
+        with Horizontal(classes="thinking-row"):
+            yield LoadingIndicator(classes="thinking-spinner")
+            yield Static(self._text, classes="thinking-text", id="thinking-label")
+
+    def update_text(self, text: str) -> None:
+        self._text = text
+        try:
+            label = self.query_one("#thinking-label", Static)
+            label.update(text)
+        except Exception:
+            pass
+
+
+class SourcesHeader(Static):
+    """Header for the citations section."""
+
+    def __init__(self, count: int, **kwargs) -> None:
+        super().__init__(f"Sources ({count})", **kwargs)
+
+
+class ChatHistory(VerticalScroll):
+    """Scrollable container for chat messages, tool calls, and citations."""
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    ChatHistory {
+        height: 100%;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    /* Messages */
+    ChatMessage {
+        margin: 1 0;
+        padding: 1 2;
+        background: $panel;
+    }
+
+    ChatMessage.user {
+        background: $primary 15%;
+        border-left: thick $primary;
+        margin-right: 4;
+    }
+
+    ChatMessage.assistant {
+        background: $success 15%;
+        border-left: thick $success;
+        margin-left: 4;
+    }
+
+    ChatMessage Markdown {
+        margin: 0;
+        padding: 0;
+    }
+
+    ChatMessage .message-prefix {
+        text-style: bold;
+    }
+
+    /* Tool calls */
+    ToolCallWidget {
+        margin: 0 0 0 4;
+        padding: 0 1;
+        height: auto;
+        background: $surface;
+        border-left: thick $warning;
+    }
+
+    ToolCallWidget.complete {
+        border-left: thick $success;
+    }
+
+    .tool-row {
+        height: auto;
+        width: 100%;
+    }
+
+    .tool-spinner {
+        width: 2;
+        height: 1;
+        color: $warning;
+    }
+
+    .tool-status {
+        width: 2;
+        color: $success;
+    }
+
+    .tool-badge {
+        width: auto;
+        color: $text;
+        text-style: bold;
+        padding-right: 1;
+    }
+
+    .tool-desc {
+        width: 1fr;
+        color: $text-muted;
+    }
+
+    /* Sources section */
+    SourcesHeader {
+        margin: 2 0 1 0;
+        padding: 0 1;
+        text-style: bold;
+        color: $text;
+        background: $primary 15%;
+        border-left: thick $primary;
+    }
+
+    /* Citations */
+    CitationWidget {
+        margin: 0 0 0 2;
+        background: $surface;
+    }
+
+    CitationWidget > CollapsibleTitle {
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    CitationWidget:focus {
+        background: $accent 15%;
+        border-left: thick $accent;
+    }
+
+    CitationWidget:focus > CollapsibleTitle {
+        color: $text;
+        text-style: bold;
+    }
+
+    CitationWidget.selected {
+        background: $accent 15%;
+        border-left: thick $accent;
+    }
+
+    CitationWidget.selected > CollapsibleTitle {
+        color: $text;
+        text-style: bold;
+    }
+
+    CitationWidget Contents {
+        padding: 1 2;
+        background: $panel;
+    }
+
+    CitationWidget .citation-metadata {
+        margin-top: 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+
+    CitationWidget .citation-image {
+        width: auto;
+        height: auto;
+        max-width: 100%;
+        max-height: 30;
+        margin: 1 0;
+    }
+
+    /* Program */
+    ProgramWidget {
+        margin: 0 0 0 2;
+        background: $surface;
+    }
+
+    ProgramWidget > CollapsibleTitle {
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    ProgramWidget Contents {
+        padding: 1 2;
+        background: $panel;
+    }
+
+    /* Thinking indicator */
+    ThinkingWidget {
+        margin: 1 0 0 4;
+        padding: 0 1;
+        height: auto;
+        background: $surface;
+        border-left: thick $primary;
+    }
+
+    .thinking-row {
+        height: auto;
+        width: 100%;
+    }
+
+    .thinking-spinner {
+        width: 2;
+        height: 1;
+        color: $primary;
+    }
+
+    .thinking-text {
+        color: $text-muted;
+        text-style: italic;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.messages: list[tuple[str, str]] = []
+        self._tool_widgets: dict[str, ToolCallWidget] = {}
+
+    async def add_message(self, role: str, content: str = "") -> ChatMessage:
+        """Add a message to the chat history."""
+        self.messages.append((role, content))
+        message_widget = ChatMessage(role, content, classes=role)
+        await self.mount(message_widget)
+        self.scroll_end(animate=False)
+        return message_widget
+
+    async def add_tool_call(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+    ) -> ToolCallWidget:
+        """Add an inline tool call indicator."""
+        widget = ToolCallWidget(tool_call_id, tool_name, args)
+        self._tool_widgets[tool_call_id] = widget
+        await self.mount(widget)
+        self.scroll_end(animate=False)
+        return widget
+
+    def update_tool_args(self, tool_call_id: str, args: dict[str, Any]) -> None:
+        """Update the args of a tool call widget."""
+        widget = self._tool_widgets.get(tool_call_id)
+        if widget:
+            widget.update_args(args)
+
+    def mark_tool_complete(self, tool_call_id: str) -> None:
+        """Mark a tool call as complete by its ID."""
+        widget = self._tool_widgets.get(tool_call_id)
+        if widget:
+            widget.mark_completed()
+            widget.add_class("complete")
+
+    async def add_citations(
+        self,
+        citations: list[Citation],
+        picture_bytes: dict[tuple[str | None, str | None], list[bytes]] | None = None,
+        include_collection: bool = False,
+    ) -> None:
+        """Add citations inline after a response.
+
+        ``picture_bytes`` maps a citation's ``(source, chunk_id)`` → list of raw
+        PNG bytes, one per entry in the citation's ``picture_refs``. Pre-fetched
+        by the caller so widget construction stays synchronous.
+        """
+        if not citations:
+            return
+        await self.mount(SourcesHeader(len(citations)))
+        picture_bytes = picture_bytes or {}
+        for citation in citations:
+            widget = CitationWidget(
+                citation,
+                picture_bytes=picture_bytes.get(
+                    qualified_id(citation.source, citation.chunk_id)
+                ),
+                include_collection=include_collection,
+            )
+            await self.mount(widget)
+        self.scroll_end(animate=False)
+
+    async def add_program(self, program: str) -> None:
+        """Add a collapsible program block after a response."""
+        if not program:
+            return
+        await self.mount(ProgramWidget(program))
+        self.scroll_end(animate=False)
+
+    async def show_thinking(self, text: str = "Thinking...") -> None:
+        """Show the thinking indicator."""
+        try:
+            self.query_one("#thinking", ThinkingWidget).update_text(text)
+        except Exception:
+            await self.mount(ThinkingWidget(text, id="thinking"))
+        self.scroll_end(animate=False)
+
+    def hide_thinking(self) -> None:
+        """Hide the thinking indicator."""
+        try:
+            self.query_one("#thinking", ThinkingWidget).remove()
+        except Exception:
+            pass
+
+    async def clear_messages(self) -> None:
+        """Clear all messages from the chat history."""
+        self.messages.clear()
+        self._tool_widgets.clear()
+        await self.remove_children()

@@ -1,0 +1,40 @@
+name: Publish to MCP Registry
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build & publish haiku.rag to pypi"]
+    types:
+      - completed
+
+jobs:
+  publish-mcp:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Generate server.json from template
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('haiku_rag_slim/pyproject.toml', 'rb'))['project']['version'])")
+          sed "s/{{VERSION}}/$VERSION/g" server.json > server.json.tmp
+          mv server.json.tmp server.json
+          echo "Generated server.json with version: $VERSION"
+      - name: Install MCP Publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo modelcontextprotocol/registry \
+            --pattern 'mcp-publisher_linux_amd64.tar.gz' -O mcp-publisher.tar.gz
+          tar -xzf mcp-publisher.tar.gz
+          chmod +x mcp-publisher
+          sudo mv mcp-publisher /usr/local/bin/
+      - name: Login to MCP Registry
+        run: mcp-publisher login github-oidc
+      - name: Publish to MCP Registry
+        run: mcp-publisher publish

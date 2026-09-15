@@ -1,0 +1,34 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ggozad/haiku-rag",
+  "title": "haiku.rag",
+  "description": "Local-first agentic RAG with citations - hybrid search, reranking, multimodal document retrieval",
+  "version": "{{VERSION}}",
+  "websiteUrl": "https://ggozad.github.io/haiku.rag/",
+  "repository": {
+    "url": "https://github.com/ggozad/haiku.rag",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "haiku-rag",
+      "version": "{{VERSION}}",
+      "runtimeHint": "uvx",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        },
+        {
+          "type": "named",
+          "name": "--stdio"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

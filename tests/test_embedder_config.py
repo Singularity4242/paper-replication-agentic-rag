@@ -1,0 +1,268 @@
+import pytest
+
+from haiku.rag.config import (
+    AppConfig,
+    EmbeddingModelConfig,
+    EmbeddingsConfig,
+    OllamaConfig,
+    ProvidersConfig,
+)
+from haiku.rag.embeddings import get_embedder
+
+
+def test_ollama_embedder_uses_config():
+    """Test that Ollama embedder uses the config passed to get_embedder."""
+    custom_config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="ollama", name="custom-model", vector_dim=512
+            ),
+        ),
+        providers=ProvidersConfig(
+            ollama=OllamaConfig(base_url="http://custom-ollama:8080"),
+        ),
+    )
+
+    embedder = get_embedder(custom_config)
+
+    assert embedder._vector_dim == 512
+
+
+def test_openai_embedder_with_base_url():
+    """Test that OpenAI embedder uses custom base_url for vLLM/LM Studio."""
+    custom_config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="openai",
+                name="some-local-model",
+                vector_dim=768,
+                base_url="http://localhost:8000/v1",
+            ),
+        ),
+    )
+
+    embedder = get_embedder(custom_config)
+
+    assert embedder._vector_dim == 768
+
+
+def test_sentence_transformers_embedder_uses_config():
+    """Test that SentenceTransformers embedder uses the config."""
+    custom_config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="sentence-transformers",
+                name="all-MiniLM-L6-v2",
+                vector_dim=384,
+            ),
+        ),
+    )
+
+    embedder = get_embedder(custom_config)
+
+    assert embedder._vector_dim == 384
+
+
+def test_unsupported_provider_raises():
+    """Test that unsupported provider raises ValueError."""
+    custom_config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="unsupported-provider", name="model", vector_dim=512
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Unsupported embedding provider"):
+        get_embedder(custom_config)
+
+
+def test_ollama_embedder_appends_v1_when_missing():
+    """Per-model base_url without /v1 should get it appended for Ollama."""
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="ollama",
+                name="qwen3-embedding:4b",
+                vector_dim=2560,
+                base_url="http://my-ollama:11434",
+            ),
+        ),
+    )
+    embedder = get_embedder(config)
+    pa_model = embedder._embedder._model  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+    assert str(pa_model.base_url).rstrip("/").endswith("/v1")  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+
+
+def test_ollama_embedder_does_not_double_append_v1():
+    """If the user already includes /v1 we leave it alone."""
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="ollama",
+                name="qwen3-embedding:4b",
+                vector_dim=2560,
+                base_url="http://my-ollama:11434/v1",
+            ),
+        ),
+    )
+    embedder = get_embedder(config)
+    pa_model = embedder._embedder._model  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+    url = str(pa_model.base_url).rstrip("/")  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+    assert url.endswith("/v1")
+    assert not url.endswith("/v1/v1")
+
+
+def test_vllm_embedder_appends_v1_when_missing():
+    """vLLM's chat-completions endpoint also lives under /v1. A user who
+    forgets the suffix would otherwise POST to <host>/embeddings and get
+    a 404 — match the Ollama behavior and append it."""
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="vllm",
+                name="Qwen/Qwen3-VL-Embedding-8B",
+                vector_dim=4096,
+                base_url="http://my-vllm:8000",
+            ),
+        ),
+    )
+    embedder = get_embedder(config)
+    base_url = embedder._base_url  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    assert base_url.endswith("/v1")
+
+
+def test_vllm_embedder_does_not_double_append_v1():
+    """If the user already includes /v1 we leave it alone."""
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="vllm",
+                name="Qwen/Qwen3-VL-Embedding-8B",
+                vector_dim=4096,
+                base_url="http://my-vllm:8000/v1",
+            ),
+        ),
+    )
+    embedder = get_embedder(config)
+    base_url = embedder._base_url.rstrip("/")  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    assert base_url.endswith("/v1")
+    assert not base_url.endswith("/v1/v1")
+
+
+def test_vector_dim_property_reports_configured_dimension():
+    from haiku.rag.embeddings import EmbedderWrapper
+
+    assert EmbedderWrapper(embedder=None, vector_dim=512).vector_dim == 512
+
+
+@pytest.mark.parametrize(
+    "provider,env_var",
+    [("voyageai", "VOYAGE_API_KEY"), ("cohere", "CO_API_KEY")],
+)
+def test_saas_providers_are_wired_without_a_request(monkeypatch, provider, env_var):
+    """Construction wires the SDK and reports the configured dimension."""
+    monkeypatch.setenv(env_var, "test-key")
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider=provider, name="some-model", vector_dim=1024
+            ),
+        ),
+    )
+
+    embedder = get_embedder(config)
+
+    assert embedder.vector_dim == 1024
+    assert embedder.supports_images is False
+    # The provider and model reach the underlying pydantic-ai embedder.
+    assert embedder._embedder._model == f"{provider}:some-model"  # ty: ignore[unresolved-attribute]
+
+
+def test_cohere_floats_rejects_missing_embeddings():
+    from types import SimpleNamespace
+
+    from haiku.rag.embeddings.cohere import _floats
+
+    result = SimpleNamespace(embeddings=SimpleNamespace(float_=None))
+
+    with pytest.raises(ValueError, match="no float embeddings"):
+        _floats(result)
+
+
+def test_voyageai_to_pil_rejects_unsupported_type():
+    from haiku.rag.embeddings.voyageai import _to_pil
+
+    with pytest.raises(TypeError, match="Unsupported image type"):
+        _to_pil("not an image")  # ty: ignore[invalid-argument-type]
+
+
+def test_openai_embedder_api_key_from_config():
+    """A config-supplied api_key reaches the embedding client."""
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="openai",
+                name="some-local-model",
+                vector_dim=768,
+                base_url="http://localhost:8000/v1",
+                api_key="sk-vendor-a",
+            ),
+        ),
+    )
+
+    embedder = get_embedder(config)
+
+    assert embedder._embedder.model._client.api_key == "sk-vendor-a"  # ty: ignore[unresolved-attribute]
+
+
+def test_ollama_embedder_api_key_from_config():
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="ollama",
+                name="qwen3-embedding:4b",
+                vector_dim=512,
+                api_key="sk-proxy",
+            ),
+        ),
+    )
+
+    embedder = get_embedder(config)
+
+    assert embedder._embedder.model._client.api_key == "sk-proxy"  # ty: ignore[unresolved-attribute]
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_vllm_embedder_api_key_from_config(multimodal):
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="vllm",
+                name="Qwen/Qwen3-VL-Embedding-8B",
+                vector_dim=1024,
+                base_url="http://vllm:8000/v1",
+                api_key="sk-vllm",
+                multimodal=multimodal,
+            ),
+        ),
+    )
+
+    embedder = get_embedder(config)
+
+    assert embedder._headers()["Authorization"] == "Bearer sk-vllm"  # ty: ignore[unresolved-attribute]
+
+
+def test_embedder_api_key_rejected_on_unplumbed_provider():
+    """Providers whose client we never build read their own vendor variable;
+    an api_key there would be silently dropped."""
+    config = AppConfig(
+        embeddings=EmbeddingsConfig(
+            model=EmbeddingModelConfig(
+                provider="voyageai", name="voyage-3", vector_dim=1024, api_key="sk-x"
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="api_key is not supported"):
+        get_embedder(config)
