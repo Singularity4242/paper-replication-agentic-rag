@@ -33,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.doAnswer;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE, properties = "paper.ingestion.enabled=false")
 @ActiveProfiles("postgres")
 @EnabledIfEnvironmentVariable(named = "TEST_DATABASE_URL", matches = ".+")
 class DocumentPostgresTests {
@@ -76,7 +76,7 @@ class DocumentPostgresTests {
         assertTrue(documentService.listDocuments(first).isEmpty());
         DocumentDTO paper = upload(first);
         assertEquals("UPLOADED", paper.status());
-        assertEquals("NOT_REQUESTED", paper.indexStatus());
+        assertEquals("QUEUED", paper.indexStatus());
         assertEquals(List.of(paper), documentService.listDocuments(first));
         String key = jdbc.sql("SELECT storage_key FROM documents WHERE id = :id").param("id", paper.id()).query(String.class).single();
         assertArrayEquals(bytes(), Files.readAllBytes(root().resolve(key)));
@@ -99,7 +99,7 @@ class DocumentPostgresTests {
                     new DocumentUploadDTO(filename, data.length, new ByteArrayInputStream(data)));
             assertEquals(filename, document.originalFilename());
             assertEquals("UPLOADED", document.status());
-            assertEquals("NOT_REQUESTED", document.indexStatus());
+            assertEquals("QUEUED", document.indexStatus());
         }
         assertEquals(6, documentService.listDocuments(library).size());
         assertEquals("LIBRARY_NOT_EMPTY", assertThrows(ConflictException.class,
@@ -124,12 +124,14 @@ class DocumentPostgresTests {
                     .param("sha", "a".repeat(64)).query().singleRow();
             Flyway latest = Flyway.configure().dataSource(System.getenv("TEST_DATABASE_URL"), System.getenv("TEST_DATABASE_USER"),
                     System.getenv("TEST_DATABASE_PASSWORD")).schemas(schema).defaultSchema(schema).load();
-            assertEquals(1, latest.migrate().migrationsExecuted);
+            assertEquals(2, latest.migrate().migrationsExecuted);
             var upgraded = jdbc.sql("SELECT * FROM " + schema + ".documents").query().singleRow();
             for (var entry : original.entrySet()) {
-                assertEquals(entry.getValue(), upgraded.get(entry.getKey()), entry.getKey());
+                if (!entry.getKey().equals("index_status")) {
+                    assertEquals(entry.getValue(), upgraded.get(entry.getKey()), entry.getKey());
+                }
             }
-            assertEquals("NOT_REQUESTED", upgraded.get("index_status"));
+            assertEquals("QUEUED", upgraded.get("index_status"));
             assertArrayEquals(bytes(), Files.readAllBytes(file));
             assertThrows(DataIntegrityViolationException.class,
                     () -> jdbc.sql("DELETE FROM " + schema + ".paper_libraries").update());

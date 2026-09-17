@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Install app backend dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install starlette uvicorn[standard] anthropic watchfiles
+    uv pip install starlette uvicorn[standard] anthropic watchfiles "python-multipart>=0.0.20"
 
 # Final layer
 FROM python:3.13-slim

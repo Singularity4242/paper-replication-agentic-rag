@@ -30,7 +30,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doAnswer;
 
 /** 使用脚本创建的临时 PostgreSQL 库验证真实 SQL 和 Service 事务。 */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE, properties = "paper.ingestion.enabled=false")
 @ActiveProfiles("postgres")
 @EnabledIfEnvironmentVariable(named = "TEST_DATABASE_URL", matches = ".+")
 class LibraryPostgresTests {

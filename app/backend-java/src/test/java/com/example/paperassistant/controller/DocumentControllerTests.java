@@ -46,10 +46,10 @@ class DocumentControllerTests {
     void createdDocumentDoesNotExposeItsStorageLocation() throws Exception {
         var time = OffsetDateTime.parse("2026-09-17T08:00:00Z");
         when(service.uploadDocument(eq(1L), any())).thenReturn(new DocumentDTO(2L, 1, "test.pdf", 5,
-                "a".repeat(64), "UPLOADED", "NOT_REQUESTED", time, time));
+                "a".repeat(64), "UPLOADED", "QUEUED", null, null, time, time));
         mvc.perform(multipart("/api/libraries/1/documents").file(file()))
                 .andExpect(status().isCreated()).andExpect(jsonPath("$.data.status").value("UPLOADED"))
-                .andExpect(jsonPath("$.data.indexStatus").value("NOT_REQUESTED"))
+                .andExpect(jsonPath("$.data.indexStatus").value("QUEUED"))
                 .andExpect(jsonPath("$.data.id").value(2))
                 .andExpect(jsonPath("$.data.storageKey").doesNotExist())
                 .andExpect(jsonPath("$.data.storagePath").doesNotExist());

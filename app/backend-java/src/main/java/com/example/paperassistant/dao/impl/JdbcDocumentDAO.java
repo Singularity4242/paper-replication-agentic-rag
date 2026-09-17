@@ -4,6 +4,7 @@ import com.example.paperassistant.dao.DocumentDAO;
 import com.example.paperassistant.model.dataobject.DocumentDO;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Optional;
 import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -15,7 +16,7 @@ public class JdbcDocumentDAO implements DocumentDAO {
     private static final RowMapper<DocumentDO> ROW_MAPPER = (rs, rowNum) -> new DocumentDO(
             rs.getLong("id"), rs.getLong("library_id"), rs.getString("original_filename"),
             rs.getString("storage_key"), rs.getLong("file_size"), rs.getString("sha256"),
-            rs.getString("status"), rs.getString("index_status"), rs.getObject("gmt_create", OffsetDateTime.class),
+            rs.getString("status"), rs.getString("index_status"), rs.getString("rag_document_id"), rs.getObject("indexed_at", OffsetDateTime.class), rs.getObject("gmt_create", OffsetDateTime.class),
             rs.getObject("gmt_modified", OffsetDateTime.class));
 
     private final JdbcClient jdbcClient;
@@ -36,7 +37,7 @@ public class JdbcDocumentDAO implements DocumentDAO {
                 INSERT INTO documents (library_id, original_filename, storage_key, file_size, sha256)
                 VALUES (:libraryId, :filename, :storageKey, :size, :sha256)
                 RETURNING id, library_id, original_filename, storage_key, file_size, sha256,
-                          status, index_status, gmt_create, gmt_modified
+                          status, index_status, rag_document_id, indexed_at, gmt_create, gmt_modified
                 """)
                 .param("libraryId", document.libraryId()).param("filename", document.originalFilename())
                 .param("storageKey", document.storageKey()).param("size", document.fileSize())
@@ -44,10 +45,24 @@ public class JdbcDocumentDAO implements DocumentDAO {
     }
 
     @Override
+    public Optional<DocumentDO> findById(long id) {
+        return jdbcClient.sql("SELECT * FROM documents WHERE id = :id").param("id", id).query(ROW_MAPPER).optional();
+    }
+
+    @Override
+    public void updateIndex(long id, String status, String ragDocumentId) {
+        jdbcClient.sql("""
+                UPDATE documents SET index_status = :status, rag_document_id = :ragId,
+                    indexed_at = CASE WHEN :status = 'INDEXED' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    gmt_modified = CURRENT_TIMESTAMP WHERE id = :id
+                """).param("status", status).param("ragId", ragDocumentId).param("id", id).update();
+    }
+
+    @Override
     public List<DocumentDO> listDocuments(long libraryId) {
         return jdbcClient.sql("""
                 SELECT id, library_id, original_filename, storage_key, file_size, sha256,
-                       status, index_status, gmt_create, gmt_modified
+                       status, index_status, rag_document_id, indexed_at, gmt_create, gmt_modified
                 FROM documents WHERE library_id = :libraryId
                 ORDER BY gmt_create DESC, id DESC
                 """).param("libraryId", libraryId).query(ROW_MAPPER).list();

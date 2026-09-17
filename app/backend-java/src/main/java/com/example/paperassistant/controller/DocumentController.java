@@ -9,6 +9,8 @@ import com.example.paperassistant.service.DocumentService;
 import jakarta.validation.constraints.Positive;
 import java.io.IOException;
 import java.util.List;
+import com.example.paperassistant.model.dto.IngestionTaskDTO;
+import com.example.paperassistant.model.vo.DocumentDetailVO;
 import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -48,8 +50,22 @@ public class DocumentController {
         return ApiResponse.success(documentService.listDocuments(libraryId).stream().map(this::toVO).toList());
     }
 
+    @GetMapping("/{documentId}")
+    public ApiResponse<DocumentDetailVO> detail(@PathVariable @Positive long libraryId,
+                                               @PathVariable @Positive long documentId) {
+        var detail = documentService.getDetail(libraryId, documentId);
+        return ApiResponse.success(new DocumentDetailVO(toVO(detail.document()), detail.task()));
+    }
+
+    @PostMapping("/{documentId}/retry")
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    public ApiResponse<IngestionTaskDTO> retry(@PathVariable @Positive long libraryId,
+                                              @PathVariable @Positive long documentId) {
+        return ApiResponse.success(documentService.retry(libraryId, documentId));
+    }
+
     private DocumentVO toVO(DocumentDTO document) {
         return new DocumentVO(document.id(), document.libraryId(), document.originalFilename(), document.fileSize(),
-                document.sha256(), document.status(), document.indexStatus(), document.gmtCreate(), document.gmtModified());
+                document.sha256(), document.status(), document.indexStatus(), document.ragDocumentId(), document.indexedAt(), document.gmtCreate(), document.gmtModified());
     }
 }

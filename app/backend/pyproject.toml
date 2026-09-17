@@ -5,6 +5,7 @@ description = "Conversational RAG application with haiku.rag"
 requires-python = ">=3.12"
 dependencies = [
     "starlette>=0.50.0",
+    "python-multipart>=0.0.20",
     "uvicorn[standard]>=0.40.0",
     "pydantic-ai-slim[ag-ui,anthropic,openai]>=2.18.0,<3.0.0",
     "python-dotenv>=1.2.1",
