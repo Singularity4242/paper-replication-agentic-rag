@@ -2,12 +2,15 @@ package com.example.paperassistant.service.impl;
 
 import com.example.paperassistant.dao.LibraryDAO;
 import com.example.paperassistant.common.exception.ResourceNotFoundException;
+import com.example.paperassistant.common.exception.ConflictException;
 import com.example.paperassistant.model.dataobject.LibraryDO;
 import com.example.paperassistant.model.dto.LibraryCreateDTO;
 import com.example.paperassistant.model.dto.LibraryDTO;
 import com.example.paperassistant.model.dto.LibraryUpdateDTO;
 import com.example.paperassistant.service.LibraryService;
 import java.util.List;
+import java.sql.SQLException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,8 +51,17 @@ public class LibraryServiceImpl implements LibraryService {
     @Override
     @Transactional
     public void deleteLibrary(long id) {
-        if (libraryDAO.deleteLibrary(id) == 0) {
-            throw new ResourceNotFoundException("论文库不存在：" + id);
+        try {
+            if (libraryDAO.deleteLibrary(id) == 0) {
+                throw new ResourceNotFoundException("论文库不存在：" + id);
+            }
+        } catch (DataIntegrityViolationException exception) {
+            // 外键在数据库中阻止非空库删除，也覆盖并发上传；不依赖前端检查。
+            if (exception.getMostSpecificCause() instanceof SQLException sqlException
+                    && "23503".equals(sqlException.getSQLState())) {
+                throw new ConflictException("LIBRARY_NOT_EMPTY", "论文库中仍有资料，暂不支持删除非空论文库");
+            }
+            throw exception;
         }
     }
 

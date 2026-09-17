@@ -30,6 +30,18 @@ public class JdbcLibraryDAO implements LibraryDAO {
     }
 
     @Override
+    public boolean existsById(long id) {
+        return jdbcClient.sql("SELECT EXISTS (SELECT 1 FROM paper_libraries WHERE id = :id)")
+                .param("id", id).query(Boolean.class).single();
+    }
+
+    @Override
+    public boolean lockById(long id) {
+        return jdbcClient.sql("SELECT id FROM paper_libraries WHERE id = :id FOR UPDATE")
+                .param("id", id).query(Long.class).optional().isPresent();
+    }
+
+    @Override
     public LibraryDO insertLibrary(LibraryDO library) {
         return jdbcClient.sql("""
                 INSERT INTO paper_libraries (name, description)

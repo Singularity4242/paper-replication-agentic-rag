@@ -7,6 +7,12 @@ import java.util.Optional;
 /** 论文库数据访问接口：只负责持久化，不处理 HTTP 或业务规则。 */
 public interface LibraryDAO {
 
+    /** 检查库是否存在。 */
+    boolean existsById(long id);
+
+    /** 在写事务中锁住库记录，协调论文上传与删除；不存在返回 false。 */
+    boolean lockById(long id);
+
     /**
      * 插入论文库，只使用输入的名称和描述。
      *

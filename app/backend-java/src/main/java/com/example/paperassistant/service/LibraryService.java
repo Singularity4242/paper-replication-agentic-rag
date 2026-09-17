@@ -34,7 +34,7 @@ public interface LibraryService {
 
     /**
      * 物理删除论文库，不存在时抛出 ResourceNotFoundException。
-     * 当前尚无论文关联；接入论文后必须在后端实现关联数据删除规则。
+     * 非空论文库由外键约束阻止删除，并返回业务冲突。
      *
      * @param id 论文库 ID
      */
