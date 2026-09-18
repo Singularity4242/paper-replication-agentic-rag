@@ -269,10 +269,12 @@ async def lifespan(_app: Starlette):
 # Internal ingestion shares the existing client and converter configuration.
 ingestion = IngestionEndpoint(get_client, config)
 business_chat = BusinessChatEndpoint(get_client, config)
+conversation_chat = BusinessChatEndpoint(get_client, config, persistent=True)
 
 # Create Starlette app
 app = Starlette(
     routes=[
+        Route("/internal/conversations/chat/stream", conversation_chat.handle, methods=["POST"]),
         Route("/internal/chat/stream", business_chat.handle, methods=["POST"]),
         Route("/internal/documents/ingest", ingestion.handle, methods=["POST"]),
         Route("/v1/chat/stream", stream_chat, methods=["POST"]),

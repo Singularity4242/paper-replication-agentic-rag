@@ -41,7 +41,8 @@ async def lifespan(app):
     with tempfile.TemporaryDirectory(prefix="rag-chat-e2e-") as directory:
         embedder = nullcontext() if real else patch("haiku.rag.store.engine.get_embedder", return_value=LocalEmbeddings())
         with embedder:
-            async with HaikuRAG(Path(directory) / "test.lancedb", config=config, create=True) as rag:
+            path = Path(os.getenv("CHAT_TEST_DATABASE_PATH", str(Path(directory) / "test.lancedb")))
+            async with HaikuRAG(path, config=config, create=True) as rag:
                 client = rag
                 yield
     client = None
@@ -53,6 +54,8 @@ async def health(request):
 
 ingestion = IngestionEndpoint(get_client, config)
 chat = BusinessChatEndpoint(get_client, config, make_agent if real else test_agent_factory, timeout=120)
+conversation_chat = BusinessChatEndpoint(get_client, config, make_agent if real else test_agent_factory, timeout=120, persistent=True)
 app = Starlette(routes=[Route("/internal/documents/ingest", ingestion.handle, methods=["POST"]),
+                        Route("/internal/conversations/chat/stream", conversation_chat.handle, methods=["POST"]),
                         Route("/internal/chat/stream", chat.handle, methods=["POST"]),
                         Route("/health", health)], lifespan=lifespan)

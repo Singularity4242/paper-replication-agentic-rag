@@ -50,6 +50,7 @@ class IngestionPostgresTests {
 
     @BeforeEach
     void clear() throws Exception {
+        jdbc.sql("DELETE FROM conversations").update();
         jdbc.sql("DELETE FROM documents").update();
         jdbc.sql("DELETE FROM paper_libraries").update();
         Files.createDirectories(root());

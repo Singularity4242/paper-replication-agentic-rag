@@ -1,0 +1,152 @@
+.header {
+  height: 99px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 32px 12px;
+  gap: 20px;
+  background: #fafafb;
+}
+.header > div:first-child {
+  min-width: 0;
+}
+.breadcrumb {
+  font-size: 9px;
+  color: #9b9fa8;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 9px;
+}
+.breadcrumb a {
+  color: #8e939d;
+}
+.header h1 {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.7px;
+  margin: 0 0 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.header p {
+  font-size: 10px;
+  color: #989da6;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 650px;
+}
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+}
+.actions :global(.ant-btn-primary) {
+  font-size: 12px;
+  height: 33px;
+  border-radius: 18px;
+  padding-inline: 16px;
+}
+.toolbar {
+  height: 47px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--line);
+  background: #fafafb;
+  gap: 10px;
+}
+.toolbar :global(.ant-segmented) {
+  background: #eeeef2;
+  font-size: 11px;
+  padding: 3px;
+}
+.toolbar :global(.ant-segmented-item-label) {
+  min-height: 26px;
+  line-height: 26px;
+  padding-inline: 13px;
+}
+.toolbar small {
+  font-size: 9px;
+  background: #e4e6ea;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin-left: 4px;
+}
+.statuses {
+  display: flex;
+  align-items: center;
+  gap: 17px;
+  color: #969daa;
+  font-size: 9px;
+}
+.statuses > span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.statuses i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
+.ready {
+  background: #81a594;
+}
+.processing {
+  background: #8ba8c9;
+}
+.unsupported {
+  color: #a79c8b;
+}
+@media (max-width: 1250px) {
+  .header {
+    padding-inline: 24px;
+  }
+  .toolbar {
+    padding-inline: 24px;
+  }
+  .statuses {
+    gap: 10px;
+  }
+  .unsupported {
+    display: none !important;
+  }
+}
+@media (max-width: 680px) {
+  .header {
+    height: 105px;
+    padding: 14px 18px;
+  }
+  .header h1 {
+    font-size: 19px;
+  }
+  .header p {
+    max-width: 235px;
+  }
+  .toolbar {
+    height: 48px;
+    padding-inline: 16px;
+  }
+  .statuses {
+    font-size: 8px;
+  }
+  .statuses > span:not(:first-child) {
+    display: none;
+  }
+  .actions {
+    gap: 0;
+  }
+  .actions :global(.ant-btn-primary) {
+    padding-inline: 10px;
+    font-size: 10px;
+    height: 30px;
+  }
+  .toolbar :global(.ant-segmented-item-label) {
+    padding-inline: 8px;
+  }
+}

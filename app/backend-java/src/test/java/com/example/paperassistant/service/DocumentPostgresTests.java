@@ -59,6 +59,7 @@ class DocumentPostgresTests {
 
     @BeforeEach
     void clear() throws Exception {
+        jdbc.sql("DELETE FROM conversations").update();
         jdbc.sql("DELETE FROM documents").update();
         jdbc.sql("DELETE FROM paper_libraries").update();
         Files.createDirectories(root());
@@ -124,7 +125,7 @@ class DocumentPostgresTests {
                     .param("sha", "a".repeat(64)).query().singleRow();
             Flyway latest = Flyway.configure().dataSource(System.getenv("TEST_DATABASE_URL"), System.getenv("TEST_DATABASE_USER"),
                     System.getenv("TEST_DATABASE_PASSWORD")).schemas(schema).defaultSchema(schema).load();
-            assertEquals(2, latest.migrate().migrationsExecuted);
+            assertEquals(3, latest.migrate().migrationsExecuted);
             var upgraded = jdbc.sql("SELECT * FROM " + schema + ".documents").query().singleRow();
             for (var entry : original.entrySet()) {
                 if (!entry.getKey().equals("index_status")) {

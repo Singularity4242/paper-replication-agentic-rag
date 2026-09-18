@@ -3,7 +3,7 @@ import asyncio
 import json
 import re
 
-from pydantic_ai.messages import ToolReturnPart
+from pydantic_ai.messages import ToolReturnPart, UserPromptPart
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 from business_chat import make_agent
@@ -18,7 +18,10 @@ def test_agent_factory(config, client, allowed_ids):
         nonlocal calls, evidence, refusal
         calls += 1
         if calls == 1:
-            question = str(messages)
+            prompts = [p.content for m in messages for p in m.parts if isinstance(p, UserPromptPart)]
+            question = str(prompts[-1])
+            if "expect-remember" in question:
+                assert any("MEMORY731" in str(p) for p in prompts[:-1]), "Missing restored history"
             refusal = "missing-fact" in question
             if "simulate-error" in question:
                 raise RuntimeError("private-token-that-must-not-leak")

@@ -1,19 +1,20 @@
-"""Single-turn business chat with a server-owned document scope.
+"""Business chat with a server-owned scope and optional persisted checkpoints.
 
-The original AG-UI endpoint remains available. This endpoint accepts neither
-conversation state nor model-supplied filters; Java supplies the validated scope.
+The single-turn and original AG-UI endpoints remain available. Only the internal
+conversation endpoint accepts Java's stored checkpoint; model tools cannot alter scope.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_ai import Agent, AgentRunResultEvent, ModelRetry
 from pydantic_ai.messages import (
-    FunctionToolCallEvent, PartDeltaEvent, PartStartEvent, TextPart, TextPartDelta,
+    FunctionToolCallEvent, ModelMessagesTypeAdapter, ModelResponse, PartDeltaEvent, PartStartEvent, TextPart, TextPartDelta,
 )
 from pydantic_ai.usage import UsageLimits
 from starlette.requests import Request
@@ -43,6 +44,48 @@ class ChatInput(BaseModel):
     libraryId: Annotated[int, Field(gt=0)]
     question: Annotated[str, Field(min_length=1, max_length=8000)]
     documents: Annotated[list[ScopeDocument], Field(min_length=1, max_length=500)]
+
+
+class Checkpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    version: Annotated[int, Field(ge=1, le=1)]
+    conversationId: Annotated[int, Field(gt=0)]
+    scopeHash: str
+    messages: list[dict[str, Any]]
+    state: dict[str, Any]
+
+
+class ConversationInput(ChatInput):
+    conversationId: Annotated[int, Field(gt=0)]
+    checkpoint: Checkpoint | None = None
+
+
+def scope_hash(value):
+    scope = {"namespace": value.namespace, "libraryId": value.libraryId,
+             "documents": sorted((d.documentId, d.ragDocumentId, d.sha256) for d in value.documents)}
+    return hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
+
+
+def restore(value):
+    """Only Java's stored checkpoint enters here, never frontend chat state."""
+    checkpoint = value.checkpoint if isinstance(value, ConversationInput) else None
+    allowed = {d.ragDocumentId for d in value.documents}
+    if checkpoint is None:
+        return [], ChatDeps(state={"rag": RAGState(document_filter=build_document_id_filter(sorted(allowed))).model_dump(mode="json")})
+    if checkpoint.conversationId != value.conversationId or checkpoint.scopeHash != scope_hash(value):
+        raise ValueError("Checkpoint scope mismatch")
+    history = ModelMessagesTypeAdapter.validate_json(json.dumps(checkpoint.messages))
+    if not history or not isinstance(history[-1], ModelResponse):
+        raise ValueError("Incomplete checkpoint history")
+    state = RAGState.model_validate(checkpoint.state["rag"])
+    if state.evidence.in_progress or state.evidence.question is None or state.evidence.question >= len(history):
+        raise ValueError("Incomplete checkpoint state")
+    if any(c.document_id not in allowed for c in state.citation_index.values()) \
+            or any(r.document_id not in allowed for rows in state.searches.values() for r in rows):
+        raise ValueError("Checkpoint evidence outside scope")
+    state.document_filter = build_document_id_filter(sorted(allowed))
+    state.sources = None
+    return history, ChatDeps(state={**checkpoint.state, "rag": state.model_dump(mode="json")})
 
 
 @dataclass
@@ -95,10 +138,11 @@ def sse(event, data):
 
 
 class BusinessChatEndpoint:
-    def __init__(self, get_client, config, agent_factory=make_agent, timeout=None):
+    def __init__(self, get_client, config, agent_factory=make_agent, timeout=None, persistent=False):
         self.get_client = get_client
         self.config = config
         self.agent_factory = agent_factory
+        self.persistent = persistent
         self.timeout = float(timeout if timeout is not None else os.getenv("RAG_CHAT_TIMEOUT_SECONDS", "180"))
         if not 0 < self.timeout <= 600:
             raise ValueError("Chat timeout must be between 0 and 600 seconds")
@@ -108,13 +152,14 @@ class BusinessChatEndpoint:
             body = bytearray()
             async for part in request.stream():
                 body.extend(part)
-                if len(body) > 262144:
+                if len(body) > (5 * 1024 * 1024 if self.persistent else 262144):
                     return JSONResponse({"errorCode": "INVALID_REQUEST"}, status_code=413)
-            value = ChatInput.model_validate_json(body)
+            value = (ConversationInput if self.persistent else ChatInput).model_validate_json(body)
             if not value.question.strip() or len({d.ragDocumentId for d in value.documents}) != len(value.documents) \
                     or len({d.documentId for d in value.documents}) != len(value.documents):
                 return JSONResponse({"errorCode": "INVALID_REQUEST"}, status_code=400)
-        except (ValidationError, ValueError):
+            history, deps = restore(value)
+        except (ValidationError, ValueError, KeyError):
             return JSONResponse({"errorCode": "INVALID_REQUEST"}, status_code=400)
 
         # Verify the business identity against LanceDB too, before exposing text.
@@ -135,17 +180,15 @@ class BusinessChatEndpoint:
             logger.warning("Chat scope validation failed: %s", type(error).__name__)
             return JSONResponse({"errorCode": "RAG_UNAVAILABLE"}, status_code=503)
 
-        return StreamingResponse(self.stream(value, client, names), media_type="text/event-stream",
+        return StreamingResponse(self.stream(value, client, names, history, deps), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    async def stream(self, value, client, names):
+    async def stream(self, value, client, names, history, deps):
         try:
             async with asyncio.timeout(self.timeout):
                 agent = self.agent_factory(self.config, client, names.keys())
-                deps = ChatDeps(state={"rag": RAGState(
-                    document_filter=build_document_id_filter(list(names))).model_dump(mode="json")})
                 yield sse("status", {"phase": "STARTED"})
-                async with agent.run_stream_events(value.question, deps=deps,
+                async with agent.run_stream_events(value.question, deps=deps, message_history=history,
                                                    usage_limits=UsageLimits(request_limit=20)) as events:
                     async for event in events:
                         if isinstance(event, FunctionToolCallEvent):
@@ -171,8 +214,21 @@ class BusinessChatEndpoint:
                                                   "chunkId": citation.chunk_id, "pageNumbers": citation.page_numbers,
                                                   "content": citation.content})
                             answer = str(event.result.output) if citations else REFUSAL
+                            checkpoint = None
+                            if self.persistent:
+                                messages = event.result.all_messages()
+                                # Store the same final answer that users saw, including enforced refusals.
+                                if not citations and isinstance(messages[-1], ModelResponse):
+                                    messages[-1] = replace(messages[-1], parts=[TextPart(REFUSAL)])
+                                checkpoint = Checkpoint(version=1, conversationId=value.conversationId, scopeHash=scope_hash(value),
+                                    messages=json.loads(ModelMessagesTypeAdapter.dump_json(messages)), state=deps.state).model_dump(mode="json")
+                                if len(json.dumps(checkpoint, ensure_ascii=False).encode()) > 4 * 1024 * 1024:
+                                    yield sse("error", {"code": "CONTEXT_LIMIT_EXCEEDED", "message": "会话上下文已达存储上限，请新建会话"})
+                                    return
                             yield sse("answer", {"answer": answer, "citations": citations,
                                                  "outcome": "ANSWERED" if citations else "INSUFFICIENT_EVIDENCE"})
+                            if checkpoint is not None:
+                                yield sse("checkpoint", checkpoint)
                             yield sse("done", {"status": "COMPLETED"})
                             return
                 raise RuntimeError("Agent stream ended before final result")

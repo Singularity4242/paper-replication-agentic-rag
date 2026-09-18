@@ -58,6 +58,7 @@ class LibraryPostgresTests {
 
     @BeforeEach
     void clearTestRows() {
+        jdbcClient.sql("DELETE FROM conversations").update();
         jdbcClient.sql("DELETE FROM documents").update();
         jdbcClient.sql("DELETE FROM paper_libraries").update();
     }

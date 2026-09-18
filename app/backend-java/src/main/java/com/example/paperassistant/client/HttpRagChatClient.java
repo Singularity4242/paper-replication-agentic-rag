@@ -53,23 +53,37 @@ public class HttpRagChatClient implements RagChatClient {
 
     @Override
     public void stream(ChatScopeDTO scope, EventSink sink) throws IOException {
+        streamInternal(scope, 0, null, sink);
+    }
+
+    @Override
+    public void streamConversation(ChatScopeDTO scope, long conversationId, JsonNode checkpoint, EventSink sink) throws IOException {
+        streamInternal(scope, conversationId, checkpoint, sink);
+    }
+
+    private void streamInternal(ChatScopeDTO scope, long conversationId, JsonNode checkpoint, EventSink sink) throws IOException {
         if (!slots.tryAcquire()) {
             error(sink, "CHAT_BUSY", "当前问答请求较多，请稍后重试");
             return;
         }
         try {
-            run(scope, sink);
+            run(scope, conversationId, checkpoint, sink);
         } finally {
             slots.release();
         }
     }
 
-    private void run(ChatScopeDTO scope, EventSink sink) throws IOException {
+    private void run(ChatScopeDTO scope, long conversationId, JsonNode checkpoint, EventSink sink) throws IOException {
         long deadline = System.nanoTime() + properties.timeout().toNanos();
-        var payload = Map.of("namespace", ingestion.namespace(), "libraryId", scope.libraryId(),
+        var payload = new java.util.HashMap<String, Object>(Map.of("namespace", ingestion.namespace(), "libraryId", scope.libraryId(),
                 "question", scope.question(), "documents", scope.documents().stream().map(d ->
-                        Map.of("documentId", d.documentId(), "ragDocumentId", d.ragDocumentId(), "sha256", d.sha256())).toList());
-        var request = HttpRequest.newBuilder(ingestion.baseUrl().resolve("/internal/chat/stream"))
+                        Map.of("documentId", d.documentId(), "ragDocumentId", d.ragDocumentId(), "sha256", d.sha256())).toList()));
+        if (conversationId > 0) {
+            payload.put("conversationId", conversationId);
+            payload.put("checkpoint", checkpoint);
+        }
+        var request = HttpRequest.newBuilder(ingestion.baseUrl().resolve(conversationId > 0
+                        ? "/internal/conversations/chat/stream" : "/internal/chat/stream"))
                 .timeout(properties.timeout()).header("Content-Type", "application/json")
                 .header("Accept", "text/event-stream")
                 .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload))).build();
@@ -107,7 +121,7 @@ public class HttpRagChatClient implements RagChatClient {
                 try { input.close(); } catch (IOException ignored) { }
             }, Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             try {
-                readEvents(input, scope, sink);
+                readEvents(input, scope, conversationId, sink);
             } catch (DownstreamClosed exception) {
                 throw exception.original;
             } catch (IOException exception) {
@@ -121,17 +135,20 @@ public class HttpRagChatClient implements RagChatClient {
         }
     }
 
-    private void readEvents(InputStream input, ChatScopeDTO scope, EventSink sink) throws IOException {
+    private void readEvents(InputStream input, ChatScopeDTO scope, long conversationId, EventSink sink) throws IOException {
         var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
         String event = "";
         var data = new StringBuilder();
         boolean answered = false;
+        boolean checkpointReceived = false;
+        int frameLimit = conversationId > 0 ? 8 * 1024 * 1024 : MAX_FRAME;
+        int streamLimit = conversationId > 0 ? 16 * 1024 * 1024 : MAX_STREAM;
         int total = 0;
         while (true) {
-            String line = boundedLine(reader);
+            String line = boundedLine(reader, frameLimit);
             if (line == null) { throw new IOException("Unexpected stream end"); }
             total += line.length();
-            if (total > MAX_STREAM) { throw new InvalidStream(); }
+            if (total > streamLimit) { throw new InvalidStream(); }
             if (line.isEmpty()) {
                 if (data.isEmpty()) { event = ""; continue; }
                 var node = json.readTree(data.toString());
@@ -153,13 +170,26 @@ public class HttpRagChatClient implements RagChatClient {
                     }
                     case "error" -> {
                         String code = node.path("code").asString("");
-                        if (!Set.of("RAG_TIMEOUT", "RAG_CHAT_FAILED").contains(code)) { code = "RAG_CHAT_FAILED"; }
-                        send(sink, event, Map.of("code", code, "message", "RAG_TIMEOUT".equals(code)
-                                ? "回答超时，请稍后重试" : "问答处理失败，请检查模型服务后重试"));
+                        if (!Set.of("RAG_TIMEOUT", "RAG_CHAT_FAILED", "CONTEXT_LIMIT_EXCEEDED").contains(code)) { code = "RAG_CHAT_FAILED"; }
+                        String message = switch (code) {
+                            case "RAG_TIMEOUT" -> "回答超时，请稍后重试";
+                            case "CONTEXT_LIMIT_EXCEEDED" -> "会话上下文已达存储上限，请新建会话";
+                            default -> "问答处理失败，请检查模型服务后重试";
+                        };
+                        send(sink, event, Map.of("code", code, "message", message));
                         return;
                     }
+                    case "checkpoint" -> {
+                        if (conversationId <= 0 || !answered || checkpointReceived || node.path("version").asInt() != 1
+                                || node.path("conversationId").asLong() != conversationId
+                                || !node.path("messages").isArray() || !node.path("state").isObject()
+                                || json.writeValueAsBytes(node).length > 4 * 1024 * 1024) { throw new InvalidStream(); }
+                        send(sink, event, node);
+                        checkpointReceived = true;
+                    }
                     case "done" -> {
-                        if (!answered || !"COMPLETED".equals(node.path("status").asString())) { throw new InvalidStream(); }
+                        if (!answered || (conversationId > 0 && !checkpointReceived)
+                                || !"COMPLETED".equals(node.path("status").asString())) { throw new InvalidStream(); }
                         send(sink, event, Map.of("status", "COMPLETED"));
                         return;
                     }
@@ -171,7 +201,7 @@ public class HttpRagChatClient implements RagChatClient {
                 event = line.substring(6).strip();
             } else if (line.startsWith("data:")) {
                 data.append(line.substring(5).stripLeading()).append('\n');
-                if (data.length() > MAX_FRAME) { throw new InvalidStream(); }
+                if (data.length() > frameLimit) { throw new InvalidStream(); }
             } else if (!line.startsWith(":")) {
                 throw new InvalidStream();
             }
@@ -207,13 +237,13 @@ public class HttpRagChatClient implements RagChatClient {
         return Map.of("answer", node.path("answer").asString(), "outcome", outcome, "citations", citations);
     }
 
-    private String boundedLine(BufferedReader reader) throws IOException {
+    private String boundedLine(BufferedReader reader, int limit) throws IOException {
         var line = new StringBuilder();
         int character;
         while ((character = reader.read()) != -1) {
             if (character == '\n') { return line.toString(); }
             if (character != '\r') { line.append((char) character); }
-            if (line.length() > MAX_FRAME) { throw new InvalidStream(); }
+            if (line.length() > limit) { throw new InvalidStream(); }
         }
         return line.isEmpty() ? null : line.toString();
     }
