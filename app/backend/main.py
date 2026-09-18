@@ -10,6 +10,7 @@ from pydantic_ai import Agent
 from pydantic_ai.ui import SSE_CONTENT_TYPE
 from pydantic_ai.ui.ag_ui import AGUIAdapter
 from ingestion import IngestionEndpoint
+from business_chat import BusinessChatEndpoint
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -267,10 +268,12 @@ async def lifespan(_app: Starlette):
 
 # Internal ingestion shares the existing client and converter configuration.
 ingestion = IngestionEndpoint(get_client, config)
+business_chat = BusinessChatEndpoint(get_client, config)
 
 # Create Starlette app
 app = Starlette(
     routes=[
+        Route("/internal/chat/stream", business_chat.handle, methods=["POST"]),
         Route("/internal/documents/ingest", ingestion.handle, methods=["POST"]),
         Route("/v1/chat/stream", stream_chat, methods=["POST"]),
         Route("/api/documents", list_documents, methods=["GET"]),

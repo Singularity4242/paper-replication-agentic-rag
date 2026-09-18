@@ -19,6 +19,13 @@ import org.slf4j.LoggerFactory;
 public class GlobalExceptionHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    @ExceptionHandler(ChatNotReadyException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiResponse<?> handleChatNotReady(ChatNotReadyException exception) {
+        return new ApiResponse<>(exception.getCode(), exception.getMessage(),
+                java.util.Map.of("documents", exception.getDocuments()));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     @ResponseStatus(HttpStatus.BAD_REQUEST)
     public ApiResponse<Void> handleValidation(MethodArgumentNotValidException exception) {
